@@ -38,11 +38,13 @@
   </div>
 
 <script>
-// ==== LIVE PILL COUNTER — MIXED ROUND + CAPSULES (FASTER + MORE RECALL) ====
-// - Works with both round tablets and capsules (ellipse fit)
-// - Much faster on iPhone (process at 480px width)
-// - Mask fusion: Otsu ∧ Adaptive OR HSV (bright/low‑sat)
-// - Strict non‑max merge, 2‑frame confirmation
+// ==== LIVE PILL COUNTER — ROUND + CAPSULES — HIGH RECALL (aims to hit full count) ====
+// Key changes in this build:
+// 1) Adds distance‑transform splitting so touching pills are separated.
+// 2) Runs a strict Hough pass every frame and fuses with contour detections (NMS dedup).
+// 3) Softer acceptance (brightness/coverage) + ellipse support for capsules.
+// 4) Counts unique detections immediately (not only confirmed) so you see the full total quickly.
+// 5) Faster processing (≤360px width) for higher FPS on iPhone.
 
 const startBtn=document.getElementById('startBtn');
 const errEl=document.getElementById('err');
@@ -56,7 +58,7 @@ let stream=null, running=false, lastTick=performance.now(), frames=0;
 let recentCounts=[];
 
 // Process size for speed
-const PROC_MAX_W = 480; // <=480px wide gives 3‑6fps on iPhone
+const PROC_MAX_W = 360; // smaller -> faster
 let procW=0, procH=0, vidW=0, vidH=0, sX=1, sY=1;
 
 // Offscreen buffer
@@ -64,7 +66,7 @@ const work=document.createElement('canvas');
 const wctx=work.getContext('2d');
 
 // OpenCV mats (proc size)
-let src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused;
+let src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt;
 let contours,hierarchy,kSmall,kBig,clahe;
 
 function showErr(m){ errEl.textContent=m||''; console.error(m); }
@@ -105,7 +107,7 @@ function syncOverlayAndBuffers(){
   sX = vidW / procW; sY = vidH / procH;
 
   // (Re)alloc mats at proc size
-  [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,contours,hierarchy,kSmall,kBig,clahe].forEach(m=>{try{m&&m.delete()}catch{}});
+  [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe].forEach(m=>{try{m&&m.delete()}catch{}});
   src=new cv.Mat(procH,procW,cv.CV_8UC4);
   rgb=new cv.Mat(procH,procW,cv.CV_8UC3);
   hsv=new cv.Mat(procH,procW,cv.CV_8UC3);
@@ -115,6 +117,7 @@ function syncOverlayAndBuffers(){
   adaptive=new cv.Mat(procH,procW,cv.CV_8UC1);
   hsvMask=new cv.Mat(procH,procW,cv.CV_8UC1);
   fused=new cv.Mat(procH,procW,cv.CV_8UC1);
+  dt=new cv.Mat(procH,procW,cv.CV_32F);
   contours=new cv.MatVector();
   hierarchy=new cv.Mat();
   const ks=odd(Math.max(3, Math.round(Math.min(procW,procH)*0.02))); // tiny clean
@@ -130,8 +133,8 @@ function median(a){ const b=[...a].sort((x,y)=>x-y), m=Math.floor(b.length/2); r
 function hsvBrightMask(){
   const chs=new cv.MatVector(); cv.split(hsv,chs); const S=chs.get(1), V=chs.get(2);
   const meanV=cv.mean(V)[0];
-  const vMin=Math.max(88, Math.round(meanV+6)); // softer to avoid misses
-  const sMax=125; // low saturation
+  const vMin=Math.max(86, Math.round(meanV+4)); // a touch softer for dim areas
+  const sMax=130; // allow slight tint
   const vMask=new cv.Mat(), sMask=new cv.Mat();
   cv.threshold(V,vMask,vMin,255,cv.THRESH_BINARY);
   cv.threshold(S,sMask,sMax,255,cv.THRESH_BINARY_INV);
@@ -140,7 +143,7 @@ function hsvBrightMask(){
   vMask.delete(); sMask.delete(); S.delete(); V.delete(); chs.delete();
 }
 
-// 2‑frame confirmation tracker
+// 2‑frame confirmation tracker (for drawing colors)
 const tracker={tracks:[], nextId:1};
 function assignTracks(dets){
   const maxDist=Math.min(vidW,vidH)*0.06; // in video pixels
@@ -185,19 +188,26 @@ function process(){
     cv.bitwise_or(both,hsvMask,fused); both.delete();
     cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
 
+    // === NEW: Split touching pills via distance transform ===
+    cv.distanceTransform(fused,dt,cv.DIST_L2,3);
+    const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
+    const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.33,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
+    const finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
+    dtn.delete(); fg.delete();
+
     // Contours (proc space)
     contours.delete(); contours=new cv.MatVector(); hierarchy.delete(); hierarchy=new cv.Mat();
-    cv.findContours(fused,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+    cv.findContours(finalMask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
 
     const gMean = cv.mean(gray)[0];
     const dets=[];
     for(let i=0;i<contours.size();i++){
       const cnt=contours.get(i);
-      const area=cv.contourArea(cnt); if(area<60){ cnt.delete(); continue; }
+      const area=cv.contourArea(cnt); if(area<55){ cnt.delete(); continue; }
       const peri=cv.arcLength(cnt,true);
       const circ=(4*Math.PI*area)/(peri*peri+1e-6);
       const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
-      const rect=cv.boundingRect(cnt); const roi=fused.roi(rect); const cov=cv.countNonZero(roi)/(rect.width*rect.height); roi.delete();
+      const rect=cv.boundingRect(cnt); const roi=finalMask.roi(rect); const cov=cv.countNonZero(roi)/(rect.width*rect.height); roi.delete();
 
       // Local brightness / uniformity
       const r2=gray.roi(rect); const m=new cv.Mat(); const s=new cv.Mat(); cv.meanStdDev(r2,m,s); const meanG=m.doubleAt(0,0); const stdG=s.doubleAt(0,0); r2.delete(); m.delete(); s.delete();
@@ -207,11 +217,11 @@ function process(){
       try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
       const aspect = isEllipse ? Math.min(er1,er2)/Math.max(er1,er2) : 1;
 
-      // Two acceptance modes
-      const roundOK   = (circ>=0.70 && solid>=0.88 && aspect>=0.78);
-      const capsuleOK = (solid>=0.90 && aspect>=0.45 && aspect<0.78);
-      const brightOK  = (meanG > gMean + 6 && stdG < 38);
-      const coverOK   = cov > 0.30;
+      // Acceptance (softer)
+      const roundOK   = (circ>=0.66 && solid>=0.86 && aspect>=0.78);
+      const capsuleOK = (solid>=0.88 && aspect>=0.35 && aspect<0.78);
+      const brightOK  = (meanG > gMean + 3 && stdG < 50);
+      const coverOK   = cov > 0.22;
 
       if(brightOK && coverOK && (roundOK || capsuleOK)){
         if(roundOK){
@@ -224,14 +234,12 @@ function process(){
       hull.delete(); cnt.delete();
     }
 
-    // Fallback: Hough circles if still empty
-    if(dets.length===0){
-      const tmp=new cv.Mat(); const circles=new cv.Mat();
-      cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
-      try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(12, Math.min(procW,procH)*0.10), 160, 38, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
-      for(let i=0;i<circles.cols;i++){ const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2]; if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue; const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy))); if(fused.ucharPtr(py,px)[0]===0) continue; dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:r*Math.sqrt((sX+sY)/2),r2:r*Math.sqrt((sX+sY)/2),a:0,score:0.95}); }
-      tmp.delete(); circles.delete();
-    }
+    // === Always run a strict Hough pass and fuse ===
+    const tmp=new cv.Mat(); const circles=new cv.Mat();
+    cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
+    try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(12, Math.min(procW,procH)*0.10), 170, 36, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
+    for(let i=0;i<circles.cols;i++){ const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2]; if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue; const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy))); if(fused.ucharPtr(py,px)[0]===0) continue; dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:r*Math.sqrt((sX+sY)/2),r2:r*Math.sqrt((sX+sY)/2),a:0,score:0.95}); }
+    tmp.delete(); circles.delete();
 
     // Non‑max suppression (video space)
     dets.sort((a,b)=>b.r1-a.r1); const final=[]; const used=new Array(dets.length).fill(false);
@@ -240,19 +248,19 @@ function process(){
       for(let j=i+1;j<dets.length;j++){
         if(used[j]) continue; const b=dets[j];
         const d=Math.hypot(a.x-b.x,a.y-b.y);
-        const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.65;
+        const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.60; // a bit tighter merge
         if(d < thr) used[j]=true;
       }
     }
 
     assignTracks(final);
 
-    // Draw
-    octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; let count=0;
+    // Draw (green=confirmed ≥2 frames, orange=tentative)
+    octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; let confirmed=0;
     for(const d of final){
-      const confirmed=(d.age||1)>=2; if(confirmed) count++;
-      octx.strokeStyle = confirmed ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
-      octx.fillStyle   = confirmed ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
+      const ok=(d.age||1)>=2; if(ok) confirmed++;
+      octx.strokeStyle = ok ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
+      octx.fillStyle   = ok ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
       if(d.type==='ellipse'){
         octx.beginPath(); octx.ellipse(d.x,d.y,Math.max(6,d.r1),Math.max(6,d.r2),d.a,0,Math.PI*2); octx.stroke();
       } else {
@@ -261,9 +269,11 @@ function process(){
       octx.beginPath(); octx.arc(d.x,d.y,4,0,Math.PI*2); octx.fill();
     }
 
-    recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
+    // Show the total unique detections right away (not only confirmed)
+    const countNow = final.length; recentCounts.push(countNow); if(recentCounts.length>7) recentCounts.shift();
     countEl.textContent = median(recentCounts);
 
+    finalMask.delete();
     updateFps();
   }catch(e){ console.error(e); showErr(e?.message||String(e)); }
   requestAnimationFrame(process);
@@ -276,7 +286,7 @@ startBtn.addEventListener('click', async()=>{
   if(ok){ const ready=()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); }); } else { startBtn.disabled=false; }
 });
 
-window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,contours,hierarchy,kSmall,kBig,clahe].forEach(m=>{try{m&&m.delete()}catch{}}); });
+window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe].forEach(m=>{try{m&&m.delete()}catch{}}); });
 </script>
 </body>
 </html>
