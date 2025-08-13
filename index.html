@@ -38,9 +38,11 @@
   </div>
 
 <script>
-// ==== LIVE PILL COUNTER — ROUND + CAPSULES — Lock confirmed pills for 20s ====
-// New: once a detection is confirmed (green), we freeze its position/size for 20s.
-// It stays green and does not wiggle; after 20s it can move again.
+// ==== LIVE PILL COUNTER — Round + Capsules ====
+// Update: (1) **Hard lock** confirmed pills for 20s — locked tracks are ignored by matcher,
+//         still drawn even if missed in a frame, and never jitter during lock.
+//         (2) Better **cluster split** when tablets touch: distance‑transform peaks + softer seeds.
+//         (3) Closer‑spacing Hough (smaller minDist) to pick neighbors.
 
 const startBtn=document.getElementById('startBtn');
 const errEl=document.getElementById('err');
@@ -145,7 +147,7 @@ function hsvBrightMask(){
   vMask.delete(); sMask.delete(); S.delete(); V.delete(); chs.delete();
 }
 
-// === Tracker with 20s lock ===
+// === Tracker with 20s hard lock ===
 const tracker={tracks:[], nextId:1};
 function assignTracks(dets){
   const now=performance.now();
@@ -154,41 +156,31 @@ function assignTracks(dets){
   // reset matched flags
   for(const t of tracker.tracks){ t.matched=false; }
 
-  // greedy assignment
+  // greedy assignment — **ignore locked tracks** so they can't absorb new neighbors
   for(const d of dets){
     let best=null,bd=1e9;
     for(const t of tracker.tracks){
+      const locked = t.lockedUntil && now < t.lockedUntil;
+      if(locked) continue; // skip locked tracks completely
       const dd=Math.hypot(d.x - t.x, d.y - t.y);
       if(dd<bd && dd<maxDist){ best=t; bd=dd; }
     }
     if(best){
-      // If locked, keep its pose frozen; only refresh timestamps/age
-      const locked = best.lockedUntil && now < best.lockedUntil;
-      if(!locked){
-        best.x=0.7*best.x+0.3*d.x; best.y=0.7*best.y+0.3*d.y;
-        best.r1=0.7*(best.r1||d.r1)+0.3*d.r1; best.r2=0.7*(best.r2||d.r2)+0.3*d.r2; best.a=d.a;
-      }
+      best.x=0.7*best.x+0.3*d.x; best.y=0.7*best.y+0.3*d.y;
+      best.r1=0.7*(best.r1||d.r1)+0.3*d.r1; best.r2=0.7*(best.r2||d.r2)+0.3*d.r2; best.a=d.a;
       best.seen=now; best.matched=true; best.age=(best.age||0)+1;
-      // propagate frozen pose to the detection so drawing doesn't jitter
-      d.x=best.x; d.y=best.y; d.r1=best.r1; d.r2=best.r2; d.a=best.a; d.id=best.id; d.age=best.age; d.locked=locked;
+      d.x=best.x; d.y=best.y; d.r1=best.r1; d.r2=best.r2; d.a=best.a; d.id=best.id; d.age=best.age; d.locked=false;
     }else{
-      // new track
       const nt={ id:tracker.nextId++, x:d.x, y:d.y, r1:d.r1, r2:d.r2, a:d.a, seen:now, matched:true, age:1, firstConfirmedAt:null, lockedUntil:null };
-      tracker.tracks.push(nt);
-      d.id=nt.id; d.age=1; d.locked=false;
+      tracker.tracks.push(nt); d.id=nt.id; d.age=1; d.locked=false;
     }
   }
 
-  // promote to locked once confirmed; keep locked tracks alive longer
-  for(const t of tracker.tracks){
-    if(!t.firstConfirmedAt && (t.age||0) >= 2){ t.firstConfirmedAt=now; t.lockedUntil = now + LOCK_MS; }
-  }
+  // Promote to locked once confirmed; keep locked tracks alive
+  for(const t of tracker.tracks){ if(!t.firstConfirmedAt && (t.age||0)>=2){ t.firstConfirmedAt=now; t.lockedUntil=now+LOCK_MS; } }
 
-  // Expire tracks (longer TTL when locked)
-  tracker.tracks = tracker.tracks.filter(t=>{
-    const ttl = (t.lockedUntil && now < t.lockedUntil) ? (LOCK_MS + 3000) : 1200;
-    return (now - t.seen) < ttl;
-  });
+  // Expire (longer TTL when locked); unmatched locked tracks remain visible in draw()
+  tracker.tracks = tracker.tracks.filter(t=>{ const ttl = (t.lockedUntil && now < t.lockedUntil) ? (LOCK_MS + 3000) : 1200; return (now - t.seen) < ttl; });
 }
 
 function process(){
@@ -222,12 +214,21 @@ function process(){
     cv.bitwise_or(both,hsvMask,fused); both.delete();
     cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
 
-    // Split touching pills via distance transform (slightly softer)
+    // ===== Better split of touching pills =====
     cv.distanceTransform(fused,dt,cv.DIST_L2,3);
     const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
-    const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.28,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
+    // local maxima as seeds
+    const kMax = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
+    const maxMap = new cv.Mat(); cv.dilate(dtn,maxMap,kMax);
+    const localMax = new cv.Mat(); cv.compare(dtn, maxMap, localMax, cv.CMP_EQ); // 1 where equal
+    localMax.convertTo(localMax, cv.CV_8U, 255);
+    cv.bitwise_and(localMax, fused, localMax); // only inside pills
+    // combine peaks with soft DT threshold
+    const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.24,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
+    cv.bitwise_or(fg, localMax, fg);
+    cv.morphologyEx(fg, fg, cv.MORPH_ERODE, kSmall); // tighten seeds a bit
     const finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
-    dtn.delete(); fg.delete();
+    dtn.delete(); fg.delete(); localMax.delete(); maxMap.delete();
 
     // Contours (proc space)
     contours.delete(); contours=new cv.MatVector(); hierarchy.delete(); hierarchy=new cv.Mat();
@@ -260,23 +261,22 @@ function process(){
       hull.delete(); cnt.delete();
     }
 
-    // Hough circles & fuse
+    // Hough circles & fuse — **closer minDist** to allow neighbors
     const tmp=new cv.Mat(); const circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
-    try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(12, Math.min(procW,procH)*0.10), 170, 36, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
+    try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(6, Math.min(procW,procH)*0.05), 170, 36, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
     for(let i=0;i<circles.cols;i++){ const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2]; if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue; const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy))); if(fused.ucharPtr(py,px)[0]===0) continue; const Rv=r*Math.sqrt((sX+sY)/2); dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95}); eqRads.push(Rv); }
     tmp.delete(); circles.delete();
 
-    // === Size prior & hard bounds to kill giant false ellipse ===
+    // === Size prior & hard bounds ===
     if(eqRads.length>=3){ const mid = median(eqRads.filter(v=>isFinite(v))); sizePrior.R = sizePrior.R? (0.7*sizePrior.R+0.3*mid) : mid; }
     const R = sizePrior.R || median(eqRads.length?eqRads:[12]);
     const minR = Math.max(6, R*0.45);
-    const maxR = Math.min(Math.min(vidW,vidH)*0.12, R*2.4); // hard cap
+    const maxR = Math.min(Math.min(vidW,vidH)*0.12, R*2.4);
 
     // Non‑max suppression (video space)
     dets.sort((a,b)=>b.r1-a.r1); const merged=[]; const used=new Array(dets.length).fill(false);
     for(let i=0;i<dets.length;i++){
       if(used[i]) continue; const a=dets[i];
-      // drop outliers by size here
       const big = Math.max(a.r1,a.r2); const small=Math.min(a.r1,a.r2);
       if(big>maxR || small<minR*0.6){ used[i]=true; continue; }
       merged.push(a); used[i]=true;
@@ -290,7 +290,7 @@ function process(){
 
     assignTracks(merged);
 
-    // Draw (green=confirmed ≥2 frames, orange=tentative). Also draw locked tracks even if not detected this frame.
+    // Draw (green=confirmed ≥2 frames or locked). Also draw locked tracks even if not detected this frame.
     octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3;
     let confirmed=0; let total = merged.length; const drawnIds=new Set(); const now=performance.now();
 
@@ -310,7 +310,7 @@ function process(){
       octx.beginPath(); octx.arc(d.x,d.y,4,0,Math.PI*2); octx.fill();
     }
 
-    // Add locked-but-unmatched tracks to drawing & counts, still green and frozen
+    // Draw locked‑but‑unmatched tracks (stay green and frozen)
     for(const t of tracker.tracks){
       const locked = t.lockedUntil && now < t.lockedUntil;
       if(locked && !drawnIds.has(t.id)){
@@ -346,4 +346,3 @@ window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().for
 </script>
 </body>
 </html>
-
