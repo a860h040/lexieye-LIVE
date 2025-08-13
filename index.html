@@ -42,10 +42,11 @@
   </div>
 
   <script>
-  // ===== FIX SUMMARY =====
-  // 1) **Overlay alignment bug**: overlay now matches the video element pixel-for-pixel.
-  // 2) **False positives**: tightened geometry, mask coverage, and added size prior via auto Hough radius calibration.
-  // 3) **Circle-only mode** (for round tablets) to avoid capsule/texture noise. Toggle CIRCLE_ONLY if needed.
+  // Live camera + overlay — FIX for “too many orange circles”:
+  //  • Add HSV bright-pill mask and fuse with Otsu mask
+  //  • Gate Hough circles by mask coverage + local brightness + uniformity
+  //  • Stricter Hough params and larger minDist
+  //  • Draw ONLY confirmed detections (hide tentative) to avoid visual clutter
 
   const startBtn=document.getElementById('startBtn');
   const errEl=document.getElementById('err');
@@ -69,6 +70,7 @@
 
   // Heuristics
   const CIRCLE_ONLY = true; // set false if capsules present
+  const SHOW_TENTATIVE = false; // hide orange tentative rings
   const CAL = { radiusSamples:[], medianR:null };
 
   function showErr(msg){ errEl.textContent=msg; console.error(msg); }
@@ -179,35 +181,48 @@
     return enhanced;
   }
 
+  function hsvLightMask(){
+    const chs = new cv.MatVector(); cv.split(hsv, chs);
+    const S = chs.get(1), V = chs.get(2);
+    const meanV = cv.mean(V)[0];
+    const vMin = Math.min(255, Math.max(115, Math.round(meanV + 18)));
+    const sMax = 90; // low saturation (white/light)
+    const vMask = new cv.Mat(); const sMask = new cv.Mat();
+    cv.threshold(V, vMask, vMin, 255, cv.THRESH_BINARY);
+    cv.threshold(S, sMask, sMax, 255, cv.THRESH_BINARY_INV);
+    const out = new cv.Mat(); cv.bitwise_and(vMask, sMask, out);
+    cv.morphologyEx(out, out, cv.MORPH_OPEN, kernelSmall);
+    vMask.delete(); sMask.delete(); S.delete(); V.delete(); chs.delete();
+    return out;
+  }
+
   function scaleToVideoAndOverlay(){
     const w = video.videoWidth||640, h = video.videoHeight||480;
-    // Size the feed box to the *actual* video pixels so overlay sits exactly on top.
-    feed.style.width = w + 'px';
-    feed.style.height = h + 'px';
-    video.style.width = w + 'px';
-    video.style.height = h + 'px';
-    overlay.width = w * (window.devicePixelRatio||1);
-    overlay.height = h * (window.devicePixelRatio||1);
-    overlay.style.width = w + 'px';
-    overlay.style.height = h + 'px';
-    // Draw using video pixel coordinates
-    const sx = (overlay.width)/(w);
-    const sy = (overlay.height)/(h);
+    feed.style.width = w + 'px'; feed.style.height = h + 'px';
+    video.style.width = w + 'px'; video.style.height = h + 'px';
+    overlay.width = w * (window.devicePixelRatio||1); overlay.height = h * (window.devicePixelRatio||1);
+    overlay.style.width = w + 'px'; overlay.style.height = h + 'px';
+    const sx = (overlay.width)/(w), sy = (overlay.height)/(h);
     octx.setTransform(sx,0,0,sy,0,0);
     work.width = w; work.height = h; initMats(w,h);
   }
 
   function houghRadiusEstimate(){
-    // Quick radius estimate during warmup to set a size prior
     const tmp = new cv.Mat();
     cv.GaussianBlur(gray, tmp, new cv.Size(5,5), 1.1, 1.1);
     const circles = new cv.Mat();
-    try{ cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1.2, 24, 140, 28, 6, Math.max(10, Math.round(Math.min(gray.rows,gray.cols)*0.25))); }catch{}
+    try{ cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1.3, 28, 180, 60, 6, Math.max(10, Math.round(Math.min(gray.rows,gray.cols)*0.25))); }catch{}
     for(let i=0;i<circles.cols;i++){ const r=circles.data32F[i*3+2]; if(isFinite(r)) CAL.radiusSamples.push(r); }
     tmp.delete(); circles.delete();
     if(CAL.radiusSamples.length>=3){ const s=[...CAL.radiusSamples].sort((a,b)=>a-b); CAL.medianR = s[Math.floor(s.length/2)];
       const r = CAL.medianR; auto.minAreaPx = Math.PI * Math.pow(r*0.75,2); auto.maxAreaPx = Math.PI * Math.pow(r*1.35,2);
     }
+  }
+
+  function uniformityScoreRect(rect){
+    const roi = gray.roi(rect); const mean = new cv.Mat(); const std = new cv.Mat();
+    cv.meanStdDev(roi, mean, std); const s = std.doubleAt(0,0); roi.delete(); mean.delete(); std.delete();
+    return 1 / (1 + s/25);
   }
 
   function processFrame(){
@@ -223,6 +238,7 @@
       src = cv.imread(work);
       cv.cvtColor(src, rgba, cv.COLOR_RGBA2RGB);
       grayWorldWB(rgba);
+      cv.cvtColor(rgba, hsv, cv.COLOR_RGB2HSV);
       cv.cvtColor(rgba, gray, cv.COLOR_RGB2GRAY);
 
       // Illumination correction + blur
@@ -235,19 +251,24 @@
       // Otsu threshold (auto polarity)
       const type = (auto.invert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
       cv.threshold(blur, mask, 0, 255, type);
-      cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernelSmall);
-      cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernelSmall);
+
+      // === NEW: HSV bright pill mask & fusion ===
+      const hsvMask = hsvLightMask();
+      const fused = new cv.Mat();
+      cv.bitwise_and(mask, hsvMask, fused);
+      cv.morphologyEx(fused, fused, cv.MORPH_OPEN, kernelSmall);
+      cv.morphologyEx(fused, fused, cv.MORPH_CLOSE, kernelSmall);
 
       // Distance split for touching pills
-      cv.distanceTransform(mask, dt, cv.DIST_L2, 3);
+      cv.distanceTransform(fused, dt, cv.DIST_L2, 3);
       const dtNorm = new cv.Mat(); cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
       const fg = new cv.Mat(); cv.threshold(dtNorm, fg, 0.35, 1.0, cv.THRESH_BINARY); fg.convertTo(fg, cv.CV_8U, 255);
-      const finalMask = new cv.Mat(); cv.bitwise_and(mask, fg, finalMask);
+      const finalMask = new cv.Mat(); cv.bitwise_and(fused, fg, finalMask);
 
       // Edges
-      cv.Canny(blur, edges, 120, 240);
+      cv.Canny(blur, edges, 160, 260);
 
-      // Contours
+      // Contours (primary path)
       contours.delete(); contours=new cv.MatVector();
       hierarchy.delete(); hierarchy=new cv.Mat();
       cv.findContours(finalMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
@@ -261,12 +282,11 @@
         const circ=(4*Math.PI*area)/(peri*peri+1e-6);
         const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
         const rect=cv.boundingRect(cnt);
-        // Require good mask coverage inside contour
-        const roi = finalMask.roi(rect); const nz=cv.countNonZero(roi); roi.delete();
+        const nz=cv.countNonZero(finalMask.roi(rect));
         const coverage = nz/Math.max(1, rect.width*rect.height);
-        // Circle-only mode expects near-round shapes
-        const passGeom = CIRCLE_ONLY ? (circ>=0.70 && solid>=0.88) : (circ>=0.45 && solid>=0.78);
-        if(passGeom && coverage>0.35){
+        const u = uniformityScoreRect(rect);
+        const passGeom = CIRCLE_ONLY ? (circ>=0.72 && solid>=0.90) : (circ>=0.48 && solid>=0.80);
+        if(passGeom && coverage>0.45 && u>0.5){
           const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
           const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
           dets.push({cx,cy,r,score:circ*solid});
@@ -274,16 +294,29 @@
         hull.delete(); cnt.delete();
       }
 
-      // Hough circles (strict) gated by size prior
+      // Hough circles (secondary path) — now STRICT + gated by mask & brightness & uniformity
       const circles = new cv.Mat();
       const tmp = new cv.Mat(); cv.GaussianBlur(blur, tmp, new cv.Size(3,3), 1.0, 1.0);
       let minR=6, maxR=Math.max(8, Math.round(Math.min(w,h)*0.25));
-      if (CAL.medianR){ minR=Math.max(5, Math.round(CAL.medianR*0.75)); maxR=Math.round(CAL.medianR*1.35); }
-      try{ cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1.2, Math.max(18, minR*2), 160, 38, minR, maxR); }catch{}
+      if (CAL.medianR){ minR=Math.max(5, Math.round(CAL.medianR*0.80)); maxR=Math.round(CAL.medianR*1.25); }
+      try{ cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1.35, Math.max(26, minR*2), 220, 72, minR, maxR); }catch{}
       for(let i=0;i<circles.cols;i++){
         const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
         if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
-        dets.push({cx,cy,r:Math.max(4,r), score:0.95});
+        const x=Math.max(0, Math.min(fused.cols-1, Math.round(cx)));
+        const y=Math.max(0, Math.min(fused.rows-1, Math.round(cy)));
+        if (fused.ucharPtr(y,x)[0]===0) continue; // center must lie in fused mask
+        const rect = new cv.Rect(Math.max(0,Math.round(cx-r*0.6)), Math.max(0,Math.round(cy-r*0.6)), Math.min(fused.cols-Math.round(cx-r*0.6), Math.round(r*1.2)), Math.min(fused.rows-Math.round(cy-r*0.6), Math.round(r*1.2)));
+        if (rect.width<=2 || rect.height<=2) continue;
+        const gROI = gray.roi(rect); const mROI = fused.roi(rect);
+        const m = new cv.Mat(); const s = new cv.Mat(); cv.meanStdDev(gROI, m, s);
+        const meanG = m.doubleAt(0,0); const stdG = s.doubleAt(0,0);
+        const coverage = cv.countNonZero(mROI)/(rect.width*rect.height);
+        gROI.delete(); mROI.delete(); m.delete(); s.delete();
+        // Require bright, uniform interior with enough mask support
+        if (coverage>0.55 && stdG<28 && meanG>cv.mean(gray)[0]+12){
+          dets.push({cx,cy,r:Math.max(4,r), score:0.96});
+        }
       }
       tmp.delete(); circles.delete();
 
@@ -307,6 +340,7 @@
       let confirmed=0;
       for(const d of final){
         const ok = (d.age||1) >= 2; if (ok) confirmed++;
+        if (!ok && !SHOW_TENTATIVE) continue;
         octx.strokeStyle = ok ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
         octx.beginPath(); octx.arc(d.cx, d.cy, Math.max(6,d.r), 0, Math.PI*2); octx.stroke();
         octx.fillStyle = ok ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
@@ -318,7 +352,7 @@
       countEl.textContent = median(recentCounts);
 
       // Cleanup temps
-      dtNorm.delete(); fg.delete(); finalMask.delete(); enhanced.delete();
+      dtNorm.delete(); fg.delete(); finalMask.delete(); fused.delete(); hsvMask.delete(); enhanced.delete();
 
       updateFps(); frameIndex++;
     }catch(e){ console.error(e); showErr(e?.message||String(e)); }
