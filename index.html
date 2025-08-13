@@ -41,8 +41,8 @@
   </div>
 
   <script>
-  // Live camera + overlay — accuracy-focused pipeline (illumination correction, multi-mask fusion, watershed split,
-  // ellipse scoring, temporal confirmation, per-pill dot+ID).
+  // Live camera + overlay — ultra‑accuracy pipeline: illumination correction, multi‑mask fusion, watershed split,
+  // ellipse scoring, + Hough circles union, temporal confirmation tracking, per‑pill red dot + green ring.
   const startBtn=document.getElementById('startBtn');
   const errEl=document.getElementById('err');
   const video=document.getElementById('video');
@@ -120,13 +120,13 @@
     kernelBig  =cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kb,kb));
     contours=new cv.MatVector();
     hierarchy=new cv.Mat();
-    try { clahe = cv.createCLAHE(2.2, new cv.Size(8,8)); } catch { clahe = null; }
+    try { clahe = cv.createCLAHE(2.4, new cv.Size(8,8)); } catch { clahe = null; }
   }
 
   // Simple tracker with confirmation
   const tracker = { nextId:1, tracks:[] };
   function assignTracks(dets){
-    const maxDist = Math.min(overlay.width, overlay.height) / (window.devicePixelRatio||1) * 0.05; // 5% of min side
+    const maxDist = Math.min(overlay.width, overlay.height) / (window.devicePixelRatio||1) * 0.045; // tighter
     const now = performance.now();
     for(const t of tracker.tracks){ t.matched=false; }
 
@@ -144,8 +144,7 @@
         d.id=tracker.nextId-1; d.age=1;
       }
     }
-    // prune stale
-    tracker.tracks = tracker.tracks.filter(t => now - t.seen < 1200);
+    tracker.tracks = tracker.tracks.filter(t => now - t.seen < 1000);
   }
 
   function median(arr){ const a=[...arr].sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
@@ -155,7 +154,7 @@
   const auto = { invert:false, minAreaPx:200, maxAreaPx:20000 };
 
   function enhanceIllumination(){
-    // Top-hat + Black-hat to remove uneven lighting: enhanced = gray + tophat - blackhat
+    // Top-hat + Black-hat to remove uneven lighting
     const opened = new cv.Mat(); const closed = new cv.Mat();
     cv.morphologyEx(gray, opened, cv.MORPH_OPEN, kernelBig);
     cv.morphologyEx(gray, closed, cv.MORPH_CLOSE, kernelBig);
@@ -165,7 +164,6 @@
     const enhanced = new cv.Mat();
     cv.add(gray, tophat, enhanced);
     cv.subtract(enhanced, blackhat, enhanced);
-    // Contrast
     try { if (clahe) { clahe.apply(enhanced, enhanced); } else { cv.equalizeHist(enhanced, enhanced); } } catch {}
     opened.delete(); closed.delete(); tophat.delete(); blackhat.delete();
     return enhanced;
@@ -228,6 +226,26 @@
     work.width = w; work.height = h; initMats(w,h);
   }
 
+  function houghCircleProposals(){
+    // Run Hough on the illumination-corrected blur to boost round pill recall
+    const circles = new cv.Mat();
+    const tmp = new cv.Mat();
+    cv.GaussianBlur(blur, tmp, new cv.Size(3,3), 1.0, 1.0);
+    const minR = Math.max(3, Math.round(Math.sqrt(Math.max(1, auto.minAreaPx)/Math.PI)) - 2);
+    const maxR = Math.max(minR+2, Math.round(Math.sqrt(Math.max(1, auto.maxAreaPx)/Math.PI)) + 2);
+    try{
+      cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1.2, Math.max(10, minR*2), 120, 22, minR, maxR);
+    }catch{}
+    const out=[];
+    for(let i=0;i<circles.cols;i++){
+      const x=circles.data32F[i*3], y=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
+      if(!isFinite(x)||!isFinite(y)||!isFinite(r)) continue;
+      out.push({cx:x, cy:y, r:Math.max(4, r), score:0.9});
+    }
+    tmp.delete(); circles.delete();
+    return out;
+  }
+
   function processFrame(){
     if(!running) return;
     try {
@@ -278,7 +296,7 @@
       // Edges for quality scoring
       cv.Canny(blur, edges, 50, 130);
 
-      // Contours → candidates with geometric checks (circularity, solidity, ellipse aspect)
+      // Contour candidates (geometry + edge density)
       cv.findContours(finalMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
       let candidates=[];
       for(let i=0;i<contours.size();i++){
@@ -311,7 +329,16 @@
         hull.delete(); cnt.delete();
       }
 
-      // Non-maximum suppression (merge near-duplicates)
+      // Hough circle proposals (boost recall for round pills)
+      const hough = houghCircleProposals();
+      // Gate Hough by mask coverage (center must be inside fused mask)
+      for(const c of hough){
+        const px = Math.max(0, Math.min(fused.cols-1, Math.round(c.cx)));
+        const py = Math.max(0, Math.min(fused.rows-1, Math.round(c.cy)));
+        if (fused.ucharPtr(py, px)[0] > 0) candidates.push(c);
+      }
+
+      // Non‑max suppression (merge near‑duplicates)
       candidates.sort((a,b)=>b.score-a.score);
       const dets=[]; const used=new Array(candidates.length).fill(false);
       for(let i=0;i<candidates.length;i++){
@@ -319,11 +346,11 @@
         for(let j=i+1;j<candidates.length;j++){
           if(used[j]) continue; const b=candidates[j];
           const d=Math.hypot(a.cx-b.cx, a.cy-b.cy);
-          if(d < Math.min(a.r,b.r)*0.7){ used[j]=true; }
+          if(d < Math.min(a.r,b.r)*0.65){ used[j]=true; }
         }
       }
 
-      // Assign IDs and confirm across frames
+      // Assign IDs and require confirmation across frames (≥2)
       assignTracks(dets);
 
       // Draw overlay
@@ -333,16 +360,14 @@
       for(const d of dets){
         const isConfirmed = (d.age||1) >= 2;
         if (isConfirmed) confirmed++;
-        // ring color by confirmation
         octx.strokeStyle = isConfirmed ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
         octx.beginPath(); octx.arc(d.cx, d.cy, Math.max(6,d.r), 0, Math.PI*2); octx.stroke();
-        // center dot
         octx.fillStyle = isConfirmed ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
         octx.beginPath(); octx.arc(d.cx, d.cy, 4, 0, Math.PI*2); octx.fill();
       }
 
       // Stable count via median over confirmed count
-      recentCounts.push(confirmed); if(recentCounts.length>7) recentCounts.shift();
+      recentCounts.push(confirmed); if(recentCounts.length>9) recentCounts.shift();
       countEl.textContent = median(recentCounts);
 
       // Cleanup temps
