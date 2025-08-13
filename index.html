@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Lexieye – Live Pill Counter (Auto‑calibrating, single view)</title>
+  <title>Lexieye – Live Pill Counter (camera view + overlay)</title>
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet" />
   <style>
@@ -11,13 +11,15 @@
     body{font-family:Poppins,system-ui,Segoe UI,Arial,sans-serif;background:radial-gradient(circle at 40% 40%,var(--bg),#e0f4ff);color:var(--text);margin:0;padding:20px}
     h1{ text-align:center; font-size:2.4rem; color:var(--primary); margin:0 0 16px }
     .wrap{ max-width:1000px; margin:auto; border-radius:28px; padding:20px; background:var(--glass); border:1px solid var(--border-glass); backdrop-filter:blur(30px) }
-    .row{ display:grid; grid-template-columns:1fr; gap:12px }
-    canvas{ width:100%; border-radius:18px; border:2px solid var(--primary) }
     .controls{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px }
     .btn{ background:var(--primary); color:#fff; border:none; border-radius:20px; padding:10px 16px; cursor:pointer }
     .btn[disabled]{ opacity:.6; cursor:not-allowed }
     .pill{ display:inline-block; padding:2px 6px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff }
     .err{ color:#b00020; font-size:.95rem }
+    .feed{ position:relative; width:100%; }
+    video{ width:100%; border-radius:18px; border:2px solid var(--primary); display:block }
+    /* Transparent overlay just for drawings */
+    #overlay{ position:absolute; inset:0; width:100%; height:100%; pointer-events:none; border-radius:18px; }
   </style>
 </head>
 <body>
@@ -31,28 +33,32 @@
     </div>
     <div class="err" id="err"></div>
 
-    <div class="row">
-      <!-- Single annotated view (no second screen). Video is hidden; we render to one canvas. -->
-      <video id="video" playsinline muted style="display:none"></video>
-      <canvas id="canvas"></canvas>
+    <!-- Camera view kept. Only the captured IMAGE layer is removed; we draw on a transparent overlay. -->
+    <div class="feed">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlay"></canvas>
     </div>
   </div>
 
   <script>
-    // Minimal UI. Single annotated canvas. Auto-calibration. Auto-brighten.
+    // Camera-visible UI with transparent overlay; no second still image.
     const startBtn=document.getElementById('startBtn');
     const errEl=document.getElementById('err');
     const video=document.getElementById('video');
-    const canvas=document.getElementById('canvas');
-    const ctx2d=canvas.getContext('2d');
+    const overlay=document.getElementById('overlay');
+    const octx=overlay.getContext('2d');
     const countEl=document.getElementById('count');
     const fpsEl=document.getElementById('fps');
 
     let stream=null, running=false, lastTick=performance.now(), frames=0, warmup=30, frameIndex=0;
     let recentCounts=[]; // median smoothing
 
+    // Offscreen work canvas for OpenCV (processing only)
+    const work=document.createElement('canvas');
+    const wctx=work.getContext('2d');
+
     // OpenCV Mats
-    let src, rgb, gray, blur, mask, morph, edges, kernel, contours, hierarchy;
+    let src, gray, blur, mask, edges, kernel, contours, hierarchy;
     let clahe=null; // contrast enhancer
 
     function showErr(msg){ errEl.textContent=msg; console.error(msg); }
@@ -79,7 +85,7 @@
           stream=await navigator.mediaDevices.getUserMedia(c);
           video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play();
 
-          // Try to improve exposure/white balance/torch if supported
+          // Improve exposure/white balance/torch if supported
           const track = stream.getVideoTracks()[0];
           const caps  = track.getCapabilities ? track.getCapabilities() : {};
           const adv = [];
@@ -97,14 +103,12 @@
     }
 
     function initMats(w,h){
-      [src,rgb,gray,blur,mask,morph,edges,kernel,contours,hierarchy].forEach(m=>{ try{ m&&m.delete(); }catch{} });
+      [src,gray,blur,mask,edges,kernel,contours,hierarchy].forEach(m=>{ try{ m&&m.delete(); }catch{} });
       if (clahe){ try{ clahe.delete(); }catch{}; clahe=null; }
       src=new cv.Mat(h,w,cv.CV_8UC4);
-      rgb=new cv.Mat(h,w,cv.CV_8UC3);
       gray=new cv.Mat(h,w,cv.CV_8UC1);
       blur=new cv.Mat(h,w,cv.CV_8UC1);
       mask=new cv.Mat(h,w,cv.CV_8UC1);
-      morph=new cv.Mat(h,w,cv.CV_8UC1);
       edges=new cv.Mat(h,w,cv.CV_8UC1);
       kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
       contours=new cv.MatVector();
@@ -119,10 +123,8 @@
     const auto = { invert:false, minAreaPx:200, maxAreaPx:20000 };
 
     function autoBrighten(intensityMean){
-      // If frame is too dark, increase gain; keep within 8‑bit range.
       if (intensityMean < 60) { cv.convertScaleAbs(gray, gray, 1.6, 12); }
       else if (intensityMean < 90) { cv.convertScaleAbs(gray, gray, 1.3, 6); }
-      // CLAHE or histogram equalization for local contrast
       try { if (clahe) { clahe.apply(gray, gray); } else { cv.equalizeHist(gray, gray); } } catch {}
     }
 
@@ -159,21 +161,24 @@
     function processFrame(){
       if(!running) return;
       const w=video.videoWidth||640, h=video.videoHeight||480;
-      if(!src || src.cols!==w || src.rows!==h){ canvas.width=w; canvas.height=h; initMats(w,h); }
+      if(!w||!h){ requestAnimationFrame(processFrame); return; }
+      // Resize overlay and work canvas to video size
+      if (overlay.width !== w || overlay.height !== h){ overlay.width=w; overlay.height=h; }
+      if (work.width !== w || work.height !== h){ work.width=w; work.height=h; initMats(w,h); }
 
-      ctx2d.drawImage(video,0,0,w,h);
-      cv.imread(canvas, src);
-      cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
-      cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+      // Draw the live video frame into the OFFSCREEN work canvas
+      wctx.drawImage(video,0,0,w,h);
+      cv.imread(work, src);
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
       // Auto brighten & contrast if dark
-      const meanScalar = cv.mean(gray); // [mean, ..]
+      const meanScalar = cv.mean(gray);
       autoBrighten(meanScalar[0]);
 
       // Denoise
       cv.GaussianBlur(gray, blur, new cv.Size(5,5), 1.1, 1.1);
 
-      // Auto‑calibrate periodically and during warm‑up
+      // Auto-calibrate periodically and during warm-up
       if (frameIndex < warmup || frameIndex % 30 === 0){
         choosePolarityAndThreshold();
       } else {
@@ -188,9 +193,9 @@
       const maskedEdges = new cv.Mat();
       cv.bitwise_and(edges, mask, maskedEdges);
 
-      // Contours & shape checks
+      // Find pills and collect their circles for overlay
       cv.findContours(maskedEdges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-      let count=0;
+      let count=0; const rings=[];
       for(let i=0;i<contours.size();i++){
         const cnt=contours.get(i); const area=cv.contourArea(cnt);
         if(area<auto.minAreaPx || area>auto.maxAreaPx){ cnt.delete(); continue; }
@@ -201,13 +206,17 @@
         if(circ>=0.42 && solid>=0.78){
           const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
           const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
-          cv.circle(rgb, new cv.Point(cx,cy), r, [0,255,0,255], 3); count++;
+          rings.push({cx,cy,r}); count++;
         }
         hull.delete(); cnt.delete();
       }
 
-      // Single annotated canvas
-      cv.imshow(canvas, rgb);
+      // Draw overlay (transparent) on top of the live video
+      octx.clearRect(0,0,overlay.width, overlay.height);
+      octx.lineWidth = 3; octx.strokeStyle = 'rgba(0,255,0,0.95)';
+      for(const {cx,cy,r} of rings){
+        octx.beginPath(); octx.arc(cx, cy, r, 0, Math.PI*2); octx.stroke();
+      }
 
       // Stable count via median of last 7 frames
       recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
@@ -220,12 +229,9 @@
 
     function setRunning(on){ running=on; if(on) requestAnimationFrame(processFrame); }
 
-    // Only enable Start after OpenCV is ready to avoid dark frames from race conditions
+    // Only enable Start after OpenCV is ready
     window.cv=window.cv||{};
-    cv['onRuntimeInitialized']=()=>{
-      startBtn.disabled=false;
-      console.log('OpenCV ready');
-    };
+    cv['onRuntimeInitialized']=()=>{ startBtn.disabled=false; console.log('OpenCV ready'); };
 
     startBtn.addEventListener('click', async()=>{
       secureContextCheck();
@@ -235,7 +241,7 @@
     });
 
     // Cleanup
-    window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,rgb,gray,blur,mask,morph,edges,kernel,contours,hierarchy].forEach(m=>{try{m&&m.delete()}catch{}}); if(clahe){try{clahe.delete()}catch{}} });
+    window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,gray,blur,mask,edges,kernel,contours,hierarchy].forEach(m=>{try{m&&m.delete()}catch{}}); if(clahe){try{clahe.delete()}catch{}} });
 
     secureContextCheck();
   </script>
