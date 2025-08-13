@@ -38,13 +38,12 @@
   </div>
 
 <script>
-// ==== LIVE PILL COUNTER — ROUND + CAPSULES — HIGH RECALL (aims to hit full count) ====
-// Key changes in this build:
-// 1) Adds distance‑transform splitting so touching pills are separated.
-// 2) Runs a strict Hough pass every frame and fuses with contour detections (NMS dedup).
-// 3) Softer acceptance (brightness/coverage) + ellipse support for capsules.
-// 4) Counts unique detections immediately (not only confirmed) so you see the full total quickly.
-// 5) Faster processing (≤360px width) for higher FPS on iPhone.
+// ==== LIVE PILL COUNTER — ROUND + CAPSULES — HIGH RECALL (21‑pill scene fix) ====
+// Fixes from your last screenshot:
+//  • Kill HUGE false ellipse on the right via a size prior + hard max size.
+//  • Split clusters better (lower DT threshold).
+//  • Count shows Confirmed / Total.
+//  • Faster (≤360px proc width) to stabilize detections.
 
 const startBtn=document.getElementById('startBtn');
 const errEl=document.getElementById('err');
@@ -60,6 +59,9 @@ let recentCounts=[];
 // Process size for speed
 const PROC_MAX_W = 360; // smaller -> faster
 let procW=0, procH=0, vidW=0, vidH=0, sX=1, sY=1;
+
+// Size prior (auto‑learned)
+const sizePrior = { R:null }; // estimated typical radius in VIDEO pixels
 
 // Offscreen buffer
 const work=document.createElement('canvas');
@@ -133,7 +135,7 @@ function median(a){ const b=[...a].sort((x,y)=>x-y), m=Math.floor(b.length/2); r
 function hsvBrightMask(){
   const chs=new cv.MatVector(); cv.split(hsv,chs); const S=chs.get(1), V=chs.get(2);
   const meanV=cv.mean(V)[0];
-  const vMin=Math.max(86, Math.round(meanV+4)); // a touch softer for dim areas
+  const vMin=Math.max(86, Math.round(meanV+4)); // softer for dim areas
   const sMax=130; // allow slight tint
   const vMask=new cv.Mat(), sMask=new cv.Mat();
   cv.threshold(V,vMask,vMin,255,cv.THRESH_BINARY);
@@ -156,6 +158,8 @@ function assignTracks(dets){
   }
   tracker.tracks = tracker.tracks.filter(t=>now-t.seen<1000);
 }
+
+function q(arr,p){ const a=[...arr].sort((x,y)=>x-y); const i=Math.max(0,Math.min(a.length-1, Math.round((a.length-1)*p))); return a[i]; }
 
 function process(){
   if(!running) return;
@@ -188,10 +192,10 @@ function process(){
     cv.bitwise_or(both,hsvMask,fused); both.delete();
     cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
 
-    // === NEW: Split touching pills via distance transform ===
+    // Split touching pills via distance transform (slightly softer)
     cv.distanceTransform(fused,dt,cv.DIST_L2,3);
     const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
-    const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.33,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
+    const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.28,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
     const finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
     dtn.delete(); fg.delete();
 
@@ -200,7 +204,7 @@ function process(){
     cv.findContours(finalMask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
 
     const gMean = cv.mean(gray)[0];
-    const dets=[];
+    const dets=[]; const eqRads=[]; // for prior
     for(let i=0;i<contours.size();i++){
       const cnt=contours.get(i);
       const area=cv.contourArea(cnt); if(area<55){ cnt.delete(); continue; }
@@ -209,55 +213,56 @@ function process(){
       const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
       const rect=cv.boundingRect(cnt); const roi=finalMask.roi(rect); const cov=cv.countNonZero(roi)/(rect.width*rect.height); roi.delete();
 
-      // Local brightness / uniformity
       const r2=gray.roi(rect); const m=new cv.Mat(); const s=new cv.Mat(); cv.meanStdDev(r2,m,s); const meanG=m.doubleAt(0,0); const stdG=s.doubleAt(0,0); r2.delete(); m.delete(); s.delete();
 
-      // Try ellipse fit for capsule / round
-      let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0;
-      try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
+      let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0; try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
       const aspect = isEllipse ? Math.min(er1,er2)/Math.max(er1,er2) : 1;
 
-      // Acceptance (softer)
       const roundOK   = (circ>=0.66 && solid>=0.86 && aspect>=0.78);
       const capsuleOK = (solid>=0.88 && aspect>=0.35 && aspect<0.78);
       const brightOK  = (meanG > gMean + 3 && stdG < 50);
       const coverOK   = cov > 0.22;
 
       if(brightOK && coverOK && (roundOK || capsuleOK)){
-        if(roundOK){
-          const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6, Math.sqrt(area/Math.PI));
-          dets.push({type:'circle', x:cx*sX, y:cy*sY, r1:r*Math.sqrt((sX+sY)/2), r2:r*Math.sqrt((sX+sY)/2), a:0, score:circ*solid});
-        }else{
-          dets.push({type:'ellipse', x:ex*sX, y:ey*sY, r1:er1*sX, r2:er2*sY, a:eang, score:solid});
-        }
+        if(roundOK){ const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6, Math.sqrt(area/Math.PI)); const Rv=r*Math.sqrt((sX+sY)/2); dets.push({type:'circle', x:cx*sX, y:cy*sY, r1:Rv, r2:Rv, a:0, score:circ*solid}); eqRads.push(Rv); }
+        else { const Rv=Math.max(er1*sX, er2*sY); dets.push({type:'ellipse', x:ex*sX, y:ey*sY, r1:er1*sX, r2:er2*sY, a:eang, score:solid}); eqRads.push(Rv); }
       }
       hull.delete(); cnt.delete();
     }
 
-    // === Always run a strict Hough pass and fuse ===
-    const tmp=new cv.Mat(); const circles=new cv.Mat();
-    cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
+    // Hough circles & fuse
+    const tmp=new cv.Mat(); const circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
     try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(12, Math.min(procW,procH)*0.10), 170, 36, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
-    for(let i=0;i<circles.cols;i++){ const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2]; if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue; const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy))); if(fused.ucharPtr(py,px)[0]===0) continue; dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:r*Math.sqrt((sX+sY)/2),r2:r*Math.sqrt((sX+sY)/2),a:0,score:0.95}); }
+    for(let i=0;i<circles.cols;i++){ const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2]; if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue; const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy))); if(fused.ucharPtr(py,px)[0]===0) continue; const Rv=r*Math.sqrt((sX+sY)/2); dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95}); eqRads.push(Rv); }
     tmp.delete(); circles.delete();
 
+    // === Size prior & hard bounds to kill giant false ellipse ===
+    if(eqRads.length>=3){ const mid = median(eqRads.filter(v=>isFinite(v))); sizePrior.R = sizePrior.R? (0.7*sizePrior.R+0.3*mid) : mid; }
+    const R = sizePrior.R || median(eqRads.length?eqRads:[12]);
+    const minR = Math.max(6, R*0.45);
+    const maxR = Math.min(Math.min(vidW,vidH)*0.12, R*2.4); // hard cap
+
     // Non‑max suppression (video space)
-    dets.sort((a,b)=>b.r1-a.r1); const final=[]; const used=new Array(dets.length).fill(false);
+    dets.sort((a,b)=>b.r1-a.r1); const merged=[]; const used=new Array(dets.length).fill(false);
     for(let i=0;i<dets.length;i++){
-      if(used[i]) continue; const a=dets[i]; final.push(a); used[i]=true;
+      if(used[i]) continue; const a=dets[i];
+      // drop outliers by size here
+      const big = Math.max(a.r1,a.r2); const small=Math.min(a.r1,a.r2);
+      if(big>maxR || small<minR*0.6){ used[i]=true; continue; }
+      merged.push(a); used[i]=true;
       for(let j=i+1;j<dets.length;j++){
         if(used[j]) continue; const b=dets[j];
         const d=Math.hypot(a.x-b.x,a.y-b.y);
-        const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.60; // a bit tighter merge
+        const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.60;
         if(d < thr) used[j]=true;
       }
     }
 
-    assignTracks(final);
+    assignTracks(merged);
 
     // Draw (green=confirmed ≥2 frames, orange=tentative)
     octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; let confirmed=0;
-    for(const d of final){
+    for(const d of merged){
       const ok=(d.age||1)>=2; if(ok) confirmed++;
       octx.strokeStyle = ok ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
       octx.fillStyle   = ok ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
@@ -269,9 +274,9 @@ function process(){
       octx.beginPath(); octx.arc(d.x,d.y,4,0,Math.PI*2); octx.fill();
     }
 
-    // Show the total unique detections right away (not only confirmed)
-    const countNow = final.length; recentCounts.push(countNow); if(recentCounts.length>7) recentCounts.shift();
-    countEl.textContent = median(recentCounts);
+    // Show Confirmed / Total
+    const total = merged.length; const conf = confirmed; recentCounts.push(total); if(recentCounts.length>7) recentCounts.shift();
+    countEl.textContent = `Confirmed: ${conf} / Total: ${median(recentCounts)}`;
 
     finalMask.delete();
     updateFps();
