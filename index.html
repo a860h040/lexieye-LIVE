@@ -164,23 +164,28 @@ function buildGradients(){
 }
 
 function ringEdgeOK(cx, cy, r){
-  const R=Math.max(3, Math.round(r));
-  const t=Math.max(EDGE_RING_MIN_PX, Math.round(R*EDGE_RING_THICK_SCALE));
-  const x0=Math.max(0, Math.round(cx - R - t));
-  const y0=Math.max(0, Math.round(cy - R - t));
-  const w=Math.min(procW - x0, 2*(R+t)+1);
-  const h=Math.min(procH - y0, 2*(R+t)+1);
-  const cxr=Math.round((R+t)); const cyr=cxr;
-  const ring=new cv.Mat.zeros(h,w,cv.CV_8UC1);
-  const inner=new cv.Mat.zeros(h,w,cv.CV_8UC1);
-  cv.circle(ring, new cv.Point(cxr,cyr), R+t, 255, -1);
-  cv.circle(inner,new cv.Point(cxr,cyr), Math.max(1,R-t), 255, -1);
+  const R = Math.max(3, Math.round(r));
+  const t = Math.max(EDGE_RING_MIN_PX, Math.round(R * EDGE_RING_THICK_SCALE));
+  const x0 = Math.max(0, Math.round(cx - R - t));
+  const y0 = Math.max(0, Math.round(cy - R - t));
+  const w  = Math.min(procW - x0, 2 * (R + t) + 1);
+  const h  = Math.min(procH - y0, 2 * (R + t) + 1);
+  const cxr = Math.round(R + t);
+  const cyr = cxr;
+  // NOTE: cv.Mat.zeros is a function, NOT a constructor — do not use `new`.
+  const ring  = cv.Mat.zeros(h, w, cv.CV_8UC1);
+  const inner = cv.Mat.zeros(h, w, cv.CV_8UC1);
+  // Use explicit Scalar with 4 channels for OpenCV.js bindings
+  cv.circle(ring,  new cv.Point(cxr, cyr), R + t, new cv.Scalar(255, 255, 255, 255), -1);
+  cv.circle(inner, new cv.Point(cxr, cyr), Math.max(1, R - t), new cv.Scalar(255, 255, 255, 255), -1);
   cv.subtract(ring, inner, ring);
-  const gROI=gradBin.roi(new cv.Rect(x0,y0,w,h));
-  const inter=new cv.Mat(); cv.bitwise_and(gROI, ring, inter);
-  const c1=cv.countNonZero(inter); const c0=cv.countNonZero(ring);
+  const gROI = gradBin.roi(new cv.Rect(x0, y0, w, h));
+  const inter = new cv.Mat();
+  cv.bitwise_and(gROI, ring, inter);
+  const c1 = cv.countNonZero(inter);
+  const c0 = cv.countNonZero(ring);
   ring.delete(); inner.delete(); inter.delete(); gROI.delete();
-  return (c1/Math.max(1,c0)) > EDGE_MIN_COVER;
+  return (c1 / Math.max(1, c0)) > EDGE_MIN_COVER;
 }
 
 // === Tracker with 5s hard lock ===
