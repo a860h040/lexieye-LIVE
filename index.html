@@ -74,6 +74,13 @@ const LOCK_MS = 10000; // 10 seconds
 const LOCK_HALO_SCALE = 1.25; // halo radius = max(r1,r2)*scale + pad
 const LOCK_HALO_PAD   = 8;    // extra pixels
 
+// === Final count freeze ===
+// Only show a final pill count when ALL detected pills are green & locked.
+// Then freeze the number for 10s. If the count is unchanged after 10s and
+// everything is still locked, extend the freeze for another 10s.
+const COUNT_FREEZE_MS = 10000; // lock the displayed number for 10s
+let countLock = { value: null, lockedUntil: 0 };
+
 // === Edge‑ring validation params ===
 const EDGE_RING_MIN_PX = 2;         // minimum ring thickness in processing pixels
 const EDGE_RING_THICK_SCALE = 0.22; // thickness = scale * radius (clamped by min above)
@@ -406,8 +413,27 @@ function process(){
     }
 
     const totalTracks = tracker.tracks.length;
-    recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
-    countEl.textContent = `Confirmed: ${confirmed} / Total: ${median(recentTotals)}`;
+const lockedCount = tracker.tracks.filter(t => t.lockedUntil && now < t.lockedUntil).length;
+recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
+
+// === Display logic: only count after ALL green areas are locked ===
+const allLocked = totalTracks > 0 && lockedCount === totalTracks;
+if (countLock.lockedUntil > now) {
+  // still frozen; do nothing (keep same number)
+} else {
+  if (allLocked) {
+    if (countLock.value !== null && countLock.value === lockedCount) {
+      // same count; extend freeze another 10s
+      countLock.lockedUntil = now + COUNT_FREEZE_MS;
+    } else {
+      // new final count; start 10s freeze
+      countLock.value = lockedCount;
+      countLock.lockedUntil = now + COUNT_FREEZE_MS;
+    }
+  }
+}
+// Show the last frozen number, or … while counting
+countEl.textContent = (countLock.value != null) ? `${countLock.value}` : '…';
 
     finalMask.delete();
     updateFps(); frameIdx++;
