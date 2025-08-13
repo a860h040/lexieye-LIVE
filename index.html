@@ -12,6 +12,7 @@
     h1{ text-align:center; font-size:2.2rem; color:var(--primary); margin:0 0 12px }
     .wrap{ max-width:1000px; margin:auto; border-radius:24px; padding:16px; background:var(--glass); border:1px solid var(--border-glass); backdrop-filter:blur(20px) }
     .controls{ display:flex; gap:10px; align-items:center; flex-wrap:wrap }
+    .controls .spacer{ flex:1 }
     .btn{ background:var(--primary); color:#fff; border:none; border-radius:16px; padding:10px 14px; cursor:pointer }
     .btn[disabled]{ opacity:.6; cursor:not-allowed }
     .pill{ display:inline-block; padding:4px 10px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff; font-size:1.4rem; font-weight:800; letter-spacing:.02em }
@@ -28,9 +29,11 @@
   <h1>💊 Lexieye — Live Pill Counter</h1>
   <div class="wrap">
     <div class="controls">
-      $1 <button id="recountBtn" class="btn">Recount Final</button>
+      <button id="startBtn" class="btn">Enable Camera & Start</button>
+      <div class="spacer"></div>
       <span class="pill"><span id="count">…</span></span>
       <span class="pill" id="fps">0 fps</span>
+      <button id="recountBtn" class="btn">Recount Final</button>
     </div>
     <div class="err" id="err"></div>
     <div class="feed">
@@ -310,27 +313,46 @@ function process(){
   requestAnimationFrame(process);
 }
 
-window.cv=window.cv||{}; cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
-$1
+window.cv=window.cv||{};
+cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
+
+startBtn.addEventListener('click', async()=>{
+  startBtn.disabled = true;
+  const ok = await startCamera();
+  if (ok) {
+    const ready = ()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); };
+    if (video.readyState >= 1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true});
+    window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); });
+  } else {
+    startBtn.disabled = false;
+  }
+});
 
 recountBtn.addEventListener('click', ()=>{
   const now = performance.now();
   const total = tracker.tracks.length;
   const locked = tracker.tracks.filter(t => t.lockedUntil && now < t.lockedUntil).length;
   if (total > 0 && locked === total) {
-    // force a fresh final now and freeze it for 10s
+    // Force a fresh final now and freeze for 10s
     countLock.value = locked;
     nextCountAt = now + COUNT_FREEZE_MS;
     countEl.textContent = `${locked}`;
   } else {
-    // not all locked — clear display and wait until all lock
+    // Not all locked — clear and wait for lock
     countLock.value = null;
     nextCountAt = 0;
     countEl.textContent = '…';
   }
-}); if(ok){ const ready=()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); }); } else { startBtn.disabled=false; }});
+});
 
-window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin,prevBlur].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
+window.addEventListener('beforeunload', ()=>{
+  try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
+  [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin,prevBlur]
+    .forEach(m=>{ try{ m && m.delete(); }catch{} });
+  cache.grad && cache.grad.delete();
+  cache.gradBin && cache.gradBin.delete();
+  cache.dtMask && cache.dtMask.delete();
+});}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin,prevBlur].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
 </body>
 </html>
