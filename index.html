@@ -42,7 +42,7 @@
 // Update: kill empty‑area false positives + speed up confirmations
 //  • Add an **edge‑ring test** (Sobel gradient) around candidate circles; only accept if enough edge energy on the rim.
 //  • **Instant‑lock** high‑confidence hits (strong edge + geometry) so you don't have to wait.
-//  • Keep 5s hard lock + halo to prevent duplicate greens and stabilize counts.
+//  • Keep 10s hard lock + halo to prevent duplicate greens and stabilize counts.
 
 const startBtn=document.getElementById('startBtn');
 const errEl=document.getElementById('err');
@@ -63,7 +63,7 @@ let procW=0, procH=0, vidW=0, vidH=0, sX=1, sY=1;
 const sizePrior = { R:null }; // estimated typical radius in VIDEO pixels
 
 // === Lock parameters ===
-const LOCK_MS = 5000; // 5 seconds
+const LOCK_MS = 10000; // 10 seconds
 const LOCK_HALO_SCALE = 1.25; // halo radius = max(r1,r2)*scale + pad
 const LOCK_HALO_PAD   = 8;    // extra pixels
 
@@ -188,7 +188,7 @@ function ringEdgeOK(cx, cy, r){
   return (c1 / Math.max(1, c0)) > EDGE_MIN_COVER;
 }
 
-// === Tracker with 5s hard lock ===
+// === Tracker with 10s hard lock ===
 const tracker={tracks:[], nextId:1};
 function lockedZones(now){
   const zones=[]; for(const t of tracker.tracks){ if(t.lockedUntil && now < t.lockedUntil){ const R = Math.max(t.r1||8, t.r2||8)*LOCK_HALO_SCALE + LOCK_HALO_PAD; zones.push({x:t.x,y:t.y,R}); } } return zones;
