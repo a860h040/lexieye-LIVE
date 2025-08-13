@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Lexieye</title>
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --primary: #007acc;
+      --accent: #d9eaff;
+      --bg: #fdfefe;
+      --glass: rgba(255,255,255,0.2);
+      --border-glass: rgba(255,255,255,0.4);
+      --text: #333;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Poppins', sans-serif;
+      background: radial-gradient(circle at 40% 40%, var(--bg), #e0f4ff);
+      color: var(--text);
+      margin: 0; padding: 20px;
+    }
+    h1 {
+      text-align: center;
+      font-size: 2.6rem;
+      margin-bottom: 40px;
+      color: var(--primary);
+    }
+    .pill-counter {
+      max-width: 960px;
+      margin: auto;
+      border-radius: 40px;
+      padding: 40px;
+      background: var(--glass);
+      border: 1px solid var(--border-glass);
+      backdrop-filter: blur(60px);
+      box-shadow: 0 60px 180px rgba(0,0,0,0.6), inset 0 0 50px rgba(255,255,255,0.1);
+    }
+    video, canvas {
+      width: 100%;
+      border-radius: 28px;
+      margin-top: 20px;
+      border: 2px solid var(--primary);
+      box-shadow: 0 24px 70px rgba(0,0,0,0.2);
+    }
+    .button {
+      background: var(--primary);
+      color: white;
+      padding: 16px 36px;
+      border: none;
+      border-radius: 30px;
+      font-size: 16px;
+      cursor: pointer;
+      margin-top: 28px;
+      transition: 0.3s;
+    }
+    .button:hover {
+      background: #005fa3;
+      transform: scale(1.08);
+    }
+    #pillCount {
+      font-size: 1.3rem;
+      font-weight: bold;
+      margin-top: 20px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <h1>💊 Lexieye </h1>
+  <div class="pill-counter">
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+    <button class="button" onclick="captureAndCount()">Capture & Count Pills</button>
+    <div id="pillCount">Detected Pills: 0</div>
+  </div>
+
+  <script>
+    let video = document.getElementById('video');
+    let canvas = document.getElementById('canvas');
+    let ctx = canvas.getContext('2d');
+
+    async function startBackCamera() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+
+      let backCamera = videoDevices.find(device =>
+        device.label.toLowerCase().includes('back') ||
+        device.label.toLowerCase().includes('environment')
+      );
+
+      let constraints = {
+        video: backCamera
+          ? { deviceId: { exact: backCamera.deviceId } }
+          : { facingMode: { exact: "environment" } }
+      };
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+      } catch (err) {
+        console.error("Camera error:", err);
+        alert("Could not access back camera.");
+      }
+    }
+
+    function captureAndCount() {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      let src = cv.imread(canvas);
+      let gray = new cv.Mat();
+      let blurred = new cv.Mat();
+      let thresh = new cv.Mat();
+      let morph = new cv.Mat();
+      let contours = new cv.MatVector();
+      let hierarchy = new cv.Mat();
+      let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+
+      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 1.5);
+      cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 15, 5);
+      cv.morphologyEx(thresh, morph, cv.MORPH_OPEN, kernel);
+      cv.findContours(morph, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+      let count = 0;
+
+      for (let i = 0; i < contours.size(); ++i) {
+        let cnt = contours.get(i);
+        let area = cv.contourArea(cnt);
+        if (area < 200 || area > 8000) { cnt.delete(); continue; }
+
+        let perimeter = cv.arcLength(cnt, true);
+        let circularity = 4 * Math.PI * area / (perimeter * perimeter);
+        if (circularity < 0.6) { cnt.delete(); continue; }
+
+        let hull = new cv.Mat();
+        cv.convexHull(cnt, hull);
+        let hullArea = cv.contourArea(hull);
+        let solidity = area / hullArea;
+        if (solidity < 0.85) { hull.delete(); cnt.delete(); continue; }
+
+        let M = cv.moments(cnt);
+        let cx = M.m10 / M.m00;
+        let cy = M.m01 / M.m00;
+        let radius = Math.sqrt(area / Math.PI);
+        cv.circle(src, new cv.Point(cx, cy), radius, [0, 255, 0, 255], 3);
+
+        count++;
+        hull.delete();
+        cnt.delete();
+      }
+
+      cv.imshow(canvas, src);
+      document.getElementById("pillCount").innerText = "Detected Pills: " + count;
+
+      src.delete(); gray.delete(); blurred.delete(); thresh.delete();
+      morph.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
+    }
+
+    window.onload = startBackCamera;
+  </script>
+</body>
+</html>
