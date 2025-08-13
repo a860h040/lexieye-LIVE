@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Lexieye</title>
+  <title>Lexieye – Live Pill Counter</title>
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet" />
   <style>
@@ -21,146 +21,255 @@
       color: var(--text);
       margin: 0; padding: 20px;
     }
-    h1 {
-      text-align: center;
-      font-size: 2.6rem;
-      margin-bottom: 40px;
-      color: var(--primary);
-    }
+    h1 { text-align: center; font-size: 2.6rem; margin-bottom: 40px; color: var(--primary); }
     .pill-counter {
-      max-width: 960px;
-      margin: auto;
-      border-radius: 40px;
-      padding: 40px;
-      background: var(--glass);
-      border: 1px solid var(--border-glass);
-      backdrop-filter: blur(60px);
+      max-width: 960px; margin: auto; border-radius: 40px; padding: 40px;
+      background: var(--glass); border: 1px solid var(--border-glass); backdrop-filter: blur(60px);
       box-shadow: 0 60px 180px rgba(0,0,0,0.6), inset 0 0 50px rgba(255,255,255,0.1);
     }
+    .row { display: grid; grid-template-columns: 1fr; gap: 16px; }
     video, canvas {
-      width: 100%;
-      border-radius: 28px;
-      margin-top: 20px;
-      border: 2px solid var(--primary);
+      width: 100%; border-radius: 28px; border: 2px solid var(--primary);
       box-shadow: 0 24px 70px rgba(0,0,0,0.2);
     }
+    .controls { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-top: 16px; }
     .button {
-      background: var(--primary);
-      color: white;
-      padding: 16px 36px;
-      border: none;
-      border-radius: 30px;
-      font-size: 16px;
-      cursor: pointer;
-      margin-top: 28px;
-      transition: 0.3s;
+      background: var(--primary); color: white; padding: 12px 22px; border: none; border-radius: 30px;
+      font-size: 15px; cursor: pointer; transition: 0.25s;
     }
-    .button:hover {
-      background: #005fa3;
-      transform: scale(1.08);
-    }
-    #pillCount {
-      font-size: 1.3rem;
-      font-weight: bold;
-      margin-top: 20px;
-      text-align: center;
-    }
+    .button:hover { background:#005fa3; transform: translateY(-1px); }
+    .pillCount { font-size: 1.2rem; font-weight: 600; }
+    .note { font-size: 0.9rem; opacity: 0.8; }
+    label { font-size: 0.95rem; }
+    input[type="range"] { width: 160px; }
   </style>
 </head>
 <body>
-  <h1>💊 Lexieye </h1>
+  <h1>💊 Lexieye – Live Pill Counter</h1>
+
   <div class="pill-counter">
-    <video id="video" autoplay playsinline></video>
-    <canvas id="canvas"></canvas>
-    <button class="button" onclick="captureAndCount()">Capture & Count Pills</button>
-    <div id="pillCount">Detected Pills: 0</div>
+    <div class="row">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+    </div>
+
+    <div class="controls">
+      <button id="toggleBtn" class="button" disabled>Starting…</button>
+      <span class="pillCount">Detected Pills: <span id="count">0</span></span>
+      <span class="note" id="status">Loading OpenCV…</span>
+    </div>
+
+    <div class="controls">
+      <label>Min area
+        <input type="range" id="minArea" min="50" max="5000" value="200">
+      </label>
+      <label>Max area
+        <input type="range" id="maxArea" min="2000" max="30000" value="8000">
+      </label>
+      <label>Circularity ≥
+        <input type="range" id="circ" min="10" max="100" value="60">
+      </label>
+      <label>Solidity ≥
+        <input type="range" id="solid" min="50" max="100" value="85">
+      </label>
+      <label>Throttle (ms)
+        <input type="range" id="throttle" min="0" max="200" value="80">
+      </label>
+    </div>
+
+    <div class="controls">
+      <label><input type="checkbox" id="capsuleMode"> Capsule mode (looser shape)</label>
+      <label><input type="checkbox" id="autoExposure"> Suggest auto-exposure lock</label>
+    </div>
   </div>
 
   <script>
-    let video = document.getElementById('video');
-    let canvas = document.getElementById('canvas');
-    let ctx = canvas.getContext('2d');
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx2d = canvas.getContext('2d');
+    const countEl = document.getElementById('count');
+    const statusEl = document.getElementById('status');
+    const toggleBtn = document.getElementById('toggleBtn');
+
+    const minAreaEl = document.getElementById('minArea');
+    const maxAreaEl = document.getElementById('maxArea');
+    const circEl    = document.getElementById('circ');
+    const solidEl   = document.getElementById('solid');
+    const throttleEl= document.getElementById('throttle');
+    const capsuleModeEl = document.getElementById('capsuleMode');
+    const autoExposureEl = document.getElementById('autoExposure');
+
+    let running = false;
+    let stream = null;
+    let lastProcess = 0;
+
+    // OpenCV mats (allocated after we know frame size)
+    let src, gray, blurred, thresh, morph, contours, hierarchy, kernel;
 
     async function startBackCamera() {
-      const devices = await navigator.mediaDevices.enumerateDevices();
+      const devices = await navigator.mediaDevices.enumerateDevices().catch(() => []);
       const videoDevices = devices.filter(d => d.kind === 'videoinput');
-
-      let backCamera = videoDevices.find(device =>
-        device.label.toLowerCase().includes('back') ||
-        device.label.toLowerCase().includes('environment')
+      let backCamera = videoDevices.find(d =>
+        (d.label || '').toLowerCase().includes('back') ||
+        (d.label || '').toLowerCase().includes('environment')
       );
 
-      let constraints = {
+      const constraints = {
         video: backCamera
           ? { deviceId: { exact: backCamera.deviceId } }
-          : { facingMode: { exact: "environment" } }
+          : { facingMode: { exact: "environment" } },
+        audio: false
       };
 
       try {
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
         video.srcObject = stream;
       } catch (err) {
-        console.error("Camera error:", err);
-        alert("Could not access back camera.");
+        console.error('Camera error:', err);
+        alert('Could not access back camera.');
       }
     }
 
-    function captureAndCount() {
-      canvas.width = video.videoWidth;
-      canvas.height = video.videoHeight;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    function initMats(width, height) {
+      // Release if they exist
+      [src, gray, blurred, thresh, morph, contours, hierarchy, kernel].forEach(m => { try { m && m.delete(); } catch {} });
 
-      let src = cv.imread(canvas);
-      let gray = new cv.Mat();
-      let blurred = new cv.Mat();
-      let thresh = new cv.Mat();
-      let morph = new cv.Mat();
-      let contours = new cv.MatVector();
-      let hierarchy = new cv.Mat();
-      let kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+      src = new cv.Mat(height, width, cv.CV_8UC4);
+      gray = new cv.Mat(height, width, cv.CV_8UC1);
+      blurred = new cv.Mat(height, width, cv.CV_8UC1);
+      thresh = new cv.Mat(height, width, cv.CV_8UC1);
+      morph = new cv.Mat(height, width, cv.CV_8UC1);
+      contours = new cv.MatVector();
+      hierarchy = new cv.Mat();
+      kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
+    }
 
+    function processFrame() {
+      if (!running) return;
+      const now = performance.now();
+      const throttleMs = parseInt(throttleEl.value, 10) || 0;
+      if (now - lastProcess < throttleMs) {
+        requestAnimationFrame(processFrame);
+        return;
+      }
+      lastProcess = now;
+
+      // Draw current video frame to canvas and into OpenCV
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+
+      if (!src || src.cols !== canvas.width || src.rows !== canvas.height) {
+        initMats(canvas.width, canvas.height);
+      }
+
+      ctx2d.drawImage(video, 0, 0, canvas.width, canvas.height);
+      cv.imread(canvas, src);
+
+      // Preprocess
       cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-      cv.GaussianBlur(gray, blurred, new cv.Size(7, 7), 1.5);
-      cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 15, 5);
+      cv.GaussianBlur(gray, blurred, new cv.Size(5,5), 1.2, 1.2, cv.BORDER_DEFAULT);
+      cv.adaptiveThreshold(blurred, thresh, 255, cv.ADAPTIVE_THRESH_MEAN_C, cv.THRESH_BINARY_INV, 11, 5);
       cv.morphologyEx(thresh, morph, cv.MORPH_OPEN, kernel);
+
+      // Find contours
       cv.findContours(morph, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
 
+      const minArea = parseInt(minAreaEl.value, 10);
+      const maxArea = parseInt(maxAreaEl.value, 10);
+      const minCirc = parseInt(circEl.value, 10) / 100;    // 0–1
+      const minSolid = parseInt(solidEl.value, 10) / 100;  // 0–1
+
       let count = 0;
-
       for (let i = 0; i < contours.size(); ++i) {
-        let cnt = contours.get(i);
-        let area = cv.contourArea(cnt);
-        if (area < 200 || area > 8000) { cnt.delete(); continue; }
+        const cnt = contours.get(i);
+        const area = cv.contourArea(cnt);
+        if (area < minArea || area > maxArea) { cnt.delete(); continue; }
 
-        let perimeter = cv.arcLength(cnt, true);
-        let circularity = 4 * Math.PI * area / (perimeter * perimeter);
-        if (circularity < 0.6) { cnt.delete(); continue; }
+        const perimeter = cv.arcLength(cnt, true);
+        const circularity = (4 * Math.PI * area) / (perimeter * perimeter + 1e-6);
 
-        let hull = new cv.Mat();
+        const hull = new cv.Mat();
         cv.convexHull(cnt, hull);
-        let hullArea = cv.contourArea(hull);
-        let solidity = area / hullArea;
-        if (solidity < 0.85) { hull.delete(); cnt.delete(); continue; }
+        const hullArea = Math.max(cv.contourArea(hull), 1e-6);
+        const solidity = area / hullArea;
 
-        let M = cv.moments(cnt);
-        let cx = M.m10 / M.m00;
-        let cy = M.m01 / M.m00;
-        let radius = Math.sqrt(area / Math.PI);
-        cv.circle(src, new cv.Point(cx, cy), radius, [0, 255, 0, 255], 3);
+        // Capsule mode loosens circularity/solidity and checks aspect ratio
+        let pass = false;
+        if (capsuleModeEl.checked) {
+          const rect = cv.boundingRect(cnt);
+          const ar = rect.width / Math.max(rect.height, 1);
+          const okAR = (ar >= 0.3 && ar <= 4.0);
+          pass = (solidity >= (minSolid * 0.9)) && okAR && (circularity >= (minCirc * 0.7));
+        } else {
+          pass = (circularity >= minCirc) && (solidity >= minSolid);
+        }
 
-        count++;
+        if (pass) {
+          // Draw result
+          const M = cv.moments(cnt);
+          const cx = M.m10 / (M.m00 || 1);
+          const cy = M.m01 / (M.m00 || 1);
+          const radius = Math.sqrt(area / Math.PI);
+          cv.circle(src, new cv.Point(cx, cy), Math.max(4, radius|0), [0,255,0,255], 3);
+          count++;
+        }
+
         hull.delete();
         cnt.delete();
       }
 
+      // Show annotated frame & update count
       cv.imshow(canvas, src);
-      document.getElementById("pillCount").innerText = "Detected Pills: " + count;
+      countEl.textContent = count;
 
-      src.delete(); gray.delete(); blurred.delete(); thresh.delete();
-      morph.delete(); kernel.delete(); contours.delete(); hierarchy.delete();
+      requestAnimationFrame(processFrame);
     }
 
-    window.onload = startBackCamera;
+    function setRunning(on) {
+      running = on;
+      toggleBtn.textContent = on ? 'Stop Live Count' : 'Start Live Count';
+      statusEl.textContent = on ? 'Counting…' : 'Paused';
+      if (on) requestAnimationFrame(processFrame);
+    }
+
+    // Optional: nudge camera app to auto-exposure-lock (UX hint only)
+    autoExposureEl.addEventListener('change', () => {
+      if (!stream) return;
+      const track = stream.getVideoTracks()[0];
+      const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+      const settings = track.getSettings ? track.getSettings() : {};
+      // Not all browsers support these constraints; we just try quietly.
+      if (capabilities.exposureMode && track.applyConstraints) {
+        track.applyConstraints({ advanced: [{ exposureMode: 'continuous' }] }).catch(()=>{});
+      }
+      // Show current resolution for debugging
+      statusEl.textContent = `Video: ${settings.width || '?'}x${settings.height || '?'} • AE ${autoExposureEl.checked ? 'requested' : 'default'}`;
+    });
+
+    // Wait for OpenCV first, then camera, then wire up UI
+    window.cv = window.cv || {};
+    cv['onRuntimeInitialized'] = async () => {
+      statusEl.textContent = 'Starting camera…';
+      await startBackCamera();
+
+      video.onloadedmetadata = () => {
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+        initMats(canvas.width, canvas.height);
+        statusEl.textContent = 'Ready.';
+        toggleBtn.disabled = false;
+        setRunning(true);
+      };
+    };
+
+    // Toggle live counting
+    toggleBtn.addEventListener('click', () => setRunning(!running));
+
+    // Cleanup on page unload
+    window.addEventListener('beforeunload', () => {
+      try { stream && stream.getTracks().forEach(t => t.stop()); } catch {}
+      [src, gray, blurred, thresh, morph, contours, hierarchy, kernel].forEach(m => { try { m && m.delete(); } catch {} });
+    });
   </script>
 </body>
 </html>
