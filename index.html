@@ -77,7 +77,9 @@ const LOCK_HALO_PAD   = 8;
 
 // === Final count freeze ===
 const COUNT_FREEZE_MS = 10000; // 10s
-let countLock = { value: null, lockedUntil: 0 };
+let countLock = { value: null };
+let nextCountAt = 0;       // next scheduled time we may update the final count
+let inAllLocked = false;   // whether we are currently in an "all green & locked" phase
 
 // === Edge‑ring ===
 const EDGE_RING_MIN_PX = 2;
@@ -415,25 +417,25 @@ function process(){
       octx.beginPath(); octx.arc(d.x,d.y,4,0,Math.PI*2); octx.fill();
     }
 
-    // Final count freeze: only when ALL tracks locked
-    const totalTracks = tracker.tracks.length;
-    const lockedCount = tracker.tracks.filter(t => t.lockedUntil && now < t.lockedUntil).length;
-    recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
+    // Scheduled final count update every 10s, only while ALL tracks are green & locked
+const totalTracks = tracker.tracks.length;
+const lockedCount = tracker.tracks.filter(t => t.lockedUntil && now < t.lockedUntil).length;
+recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
 
-    const allLocked = totalTracks > 0 && lockedCount === totalTracks;
-    if (countLock.lockedUntil > now) {
-      // keep frozen
-    } else {
-      if (allLocked) {
-        if (countLock.value !== null && countLock.value === lockedCount) {
-          countLock.lockedUntil = now + COUNT_FREEZE_MS; // extend
-        } else {
-          countLock.value = lockedCount; // new final
-          countLock.lockedUntil = now + COUNT_FREEZE_MS;
-        }
-      }
-    }
-    countEl.textContent = (countLock.value != null) ? `${countLock.value}` : '…';
+const allLocked = totalTracks > 0 && lockedCount === totalTracks;
+if (allLocked) {
+  if (!inAllLocked) { inAllLocked = true; nextCountAt = 0; } // start cycle immediately
+  const nowMs = now;
+  if (nowMs >= nextCountAt) {
+    countLock.value = lockedCount;           // publish new final
+    nextCountAt = nowMs + COUNT_FREEZE_MS;   // schedule next update in 10s
+  }
+} else {
+  inAllLocked = false; // pause schedule until everything is locked again
+}
+
+// Show the latest final number (frozen between 10s updates). If never finalized yet, show ellipsis.
+countEl.textContent = (countLock.value != null) ? `${countLock.value}` : '…';
 
     // update prev blur for next diff
     if(prevBlur){ try{ prevBlur.delete(); }catch{} }
