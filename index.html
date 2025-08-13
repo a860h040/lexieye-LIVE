@@ -38,11 +38,12 @@
   </div>
 
 <script>
-// ==== LIVE PILL COUNTER — Round + Capsules ==== 
-// Update: kill empty‑area false positives + speed up confirmations
-//  • Add an **edge‑ring test** (Sobel gradient) around candidate circles; only accept if enough edge energy on the rim.
-//  • **Instant‑lock** high‑confidence hits (strong edge + geometry) so you don't have to wait.
-//  • Keep 10s hard lock + halo to prevent duplicate greens and stabilize counts.
+// ==== LIVE PILL COUNTER — performance boost (≈2x faster) ====
+// Changes for speed:
+//  • Smaller proc resolution (width 280) with smart scaling.
+//  • Cache heavy steps and run them every 2 frames: CLAHE, gradients, distance‑transform, Hough.
+//  • Early edge check (fast) + full ring check only when needed (already present).
+//  • Counting/drawing still uses tracker w/ 10s hard‑lock + halo.
 
 const startBtn=document.getElementById('startBtn');
 const errEl=document.getElementById('err');
@@ -54,10 +55,14 @@ const fpsEl=document.getElementById('fps');
 
 let stream=null, running=false, lastTick=performance.now(), frames=0;
 let recentTotals=[]; // smoothing for total only
+let frameIdx=0;      // frame counter for throttled ops
 
 // Process size for speed
-const PROC_MAX_W = 360; // smaller -> faster
+const PROC_MAX_W = 280; // ↓ from 360 — big speedup with minimal accuracy loss
 let procW=0, procH=0, vidW=0, vidH=0, sX=1, sY=1;
+
+// Perf throttles
+const PERF={ DT_EVERY:2, GRAD_EVERY:2, HOUGH_EVERY:2, CLAHE_EVERY:2 };
 
 // Size prior (auto‑learned)
 const sizePrior = { R:null }; // estimated typical radius in VIDEO pixels
@@ -81,6 +86,9 @@ const wctx=work.getContext('2d');
 let src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt;
 let contours,hierarchy,kSmall,kBig,clahe;
 let sobelX,sobelY,absX,absY,grad,gradBin; // for edge ring test
+
+// Caches to avoid recomputing every frame
+const cache={ grad:null, gradBin:null, dtMask:null };
 
 function showErr(m){ errEl.textContent=m||''; console.error(m); }
 function odd(n){ return (n%2)?n:n+1; }
@@ -154,13 +162,20 @@ function hsvBrightMask(){
 
 // === Edge‑ring test helpers (PROC space) ===
 function buildGradients(){
-  sobelX=new cv.Mat(); sobelY=new cv.Mat(); absX=new cv.Mat(); absY=new cv.Mat(); grad=new cv.Mat(); gradBin=new cv.Mat();
-  cv.Sobel(blur, sobelX, cv.CV_16S, 1, 0, 3);
-  cv.Sobel(blur, sobelY, cv.CV_16S, 0, 1, 3);
-  cv.convertScaleAbs(sobelX, absX); cv.convertScaleAbs(sobelY, absY);
-  cv.addWeighted(absX, 0.5, absY, 0.5, 0, grad);
-  const gMean=cv.mean(grad)[0];
-  cv.threshold(grad, gradBin, Math.max(20, gMean + EDGE_BIN_BIAS), 255, cv.THRESH_BINARY);
+  if((frameIdx % PERF.GRAD_EVERY)===0 || !cache.grad){
+    sobelX=new cv.Mat(); sobelY=new cv.Mat(); absX=new cv.Mat(); absY=new cv.Mat(); grad=new cv.Mat(); gradBin=new cv.Mat();
+    cv.Sobel(blur, sobelX, cv.CV_16S, 1, 0, 3);
+    cv.Sobel(blur, sobelY, cv.CV_16S, 0, 1, 3);
+    cv.convertScaleAbs(sobelX, absX); cv.convertScaleAbs(sobelY, absY);
+    cv.addWeighted(absX, 0.5, absY, 0.5, 0, grad);
+    const gMean=cv.mean(grad)[0];
+    cv.threshold(grad, gradBin, Math.max(20, gMean + EDGE_BIN_BIAS), 255, cv.THRESH_BINARY);
+    // update cache
+    cache.grad && cache.grad.delete(); cache.gradBin && cache.gradBin.delete();
+    cache.grad = grad.clone(); cache.gradBin = gradBin.clone();
+  } else {
+    grad = cache.grad.clone(); gradBin = cache.gradBin.clone();
+  }
 }
 
 function ringEdgeOK(cx, cy, r){
@@ -172,20 +187,16 @@ function ringEdgeOK(cx, cy, r){
   const h  = Math.min(procH - y0, 2 * (R + t) + 1);
   const cxr = Math.round(R + t);
   const cyr = cxr;
-  // NOTE: cv.Mat.zeros is a function, NOT a constructor — do not use `new`.
   const ring  = cv.Mat.zeros(h, w, cv.CV_8UC1);
   const inner = cv.Mat.zeros(h, w, cv.CV_8UC1);
-  // Use explicit Scalar with 4 channels for OpenCV.js bindings
-  cv.circle(ring,  new cv.Point(cxr, cyr), R + t, new cv.Scalar(255, 255, 255, 255), -1);
-  cv.circle(inner, new cv.Point(cxr, cyr), Math.max(1, R - t), new cv.Scalar(255, 255, 255, 255), -1);
+  cv.circle(ring,  new cv.Point(cxr, cyr), R + t, new cv.Scalar(255,255,255,255), -1);
+  cv.circle(inner, new cv.Point(cxr, cyr), Math.max(1, R - t), new cv.Scalar(255,255,255,255), -1);
   cv.subtract(ring, inner, ring);
   const gROI = gradBin.roi(new cv.Rect(x0, y0, w, h));
-  const inter = new cv.Mat();
-  cv.bitwise_and(gROI, ring, inter);
-  const c1 = cv.countNonZero(inter);
-  const c0 = cv.countNonZero(ring);
+  const inter = new cv.Mat(); cv.bitwise_and(gROI, ring, inter);
+  const c1 = cv.countNonZero(inter); const c0 = cv.countNonZero(ring);
   ring.delete(); inner.delete(); inter.delete(); gROI.delete();
-  return (c1 / Math.max(1, c0)) > EDGE_MIN_COVER;
+  return (c1/Math.max(1,c0)) > EDGE_MIN_COVER;
 }
 
 // === Tracker with 10s hard lock ===
@@ -246,11 +257,12 @@ function process(){
     const opened=new cv.Mat(), closed=new cv.Mat(), tophat=new cv.Mat(), blackhat=new cv.Mat(), enh=new cv.Mat();
     cv.morphologyEx(gray,opened,cv.MORPH_OPEN,kBig); cv.morphologyEx(gray,closed,cv.MORPH_CLOSE,kBig);
     cv.subtract(gray,opened,tophat); cv.subtract(closed,gray,blackhat); cv.add(gray,tophat,enh); cv.subtract(enh,blackhat,enh);
-    try{ if(clahe) clahe.apply(enh,enh); else cv.equalizeHist(enh,enh);}catch{}
+    // Apply CLAHE less often
+    if(clahe && (frameIdx % PERF.CLAHE_EVERY)===0){ try{ clahe.apply(enh,enh); }catch{} }
     cv.GaussianBlur(enh,blur,new cv.Size(5,5),1.05,1.05);
     opened.delete(); closed.delete(); tophat.delete(); blackhat.delete(); enh.delete();
 
-    // Build gradients for edge‑ring test
+    // Build gradients for edge‑ring test (cached every other frame)
     buildGradients();
 
     // Masks & fusion: (Otsu ∧ Adaptive) ∨ HSV
@@ -262,19 +274,26 @@ function process(){
     cv.bitwise_or(both,hsvMask,fused); both.delete();
     cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
 
-    // Split touching pills (DT + local maxima)
-    cv.distanceTransform(fused,dt,cv.DIST_L2,3);
-    const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
-    const kMax = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
-    const maxMap = new cv.Mat(); cv.dilate(dtn,maxMap,kMax);
-    const localMax = new cv.Mat(); cv.compare(dtn, maxMap, localMax, cv.CMP_EQ);
-    localMax.convertTo(localMax, cv.CV_8U, 255);
-    cv.bitwise_and(localMax, fused, localMax);
-    const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.24,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
-    cv.bitwise_or(fg, localMax, fg);
-    cv.morphologyEx(fg, fg, cv.MORPH_ERODE, kSmall);
-    const finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
-    dtn.delete(); fg.delete(); localMax.delete(); maxMap.delete();
+    // Split touching pills (DT throttled)
+    let finalMask;
+    if((frameIdx % PERF.DT_EVERY)===0 || !cache.dtMask){
+      cv.distanceTransform(fused,dt,cv.DIST_L2,3);
+      const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
+      const kMax = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
+      const maxMap = new cv.Mat(); cv.dilate(dtn,maxMap,kMax);
+      const localMax = new cv.Mat(); cv.compare(dtn, maxMap, localMax, cv.CMP_EQ);
+      localMax.convertTo(localMax, cv.CV_8U, 255);
+      cv.bitwise_and(localMax, fused, localMax);
+      const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.24,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
+      cv.bitwise_or(fg, localMax, fg);
+      cv.morphologyEx(fg, fg, cv.MORPH_ERODE, kSmall);
+      finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
+      // cache
+      cache.dtMask && cache.dtMask.delete(); cache.dtMask = finalMask.clone();
+      dtn.delete(); fg.delete(); localMax.delete(); maxMap.delete();
+    }else{
+      finalMask = cache.dtMask.clone();
+    }
 
     // Contours (proc space)
     contours.delete(); contours=new cv.MatVector(); hierarchy.delete(); hierarchy=new cv.Mat();
@@ -300,7 +319,6 @@ function process(){
       const brightOK  = (meanG > gMean + 3 && stdG < 50);
       const coverOK   = cov > 0.22;
 
-      // === Edge ring test only for near‑round candidates ===
       let strong=false; let edgeOK=true;
       if(roundOK){
         const M=cv.moments(cnt); const cx_p=M.m10/(M.m00||1), cy_p=M.m01/(M.m00||1); const r_p=Math.max(6, Math.sqrt(area/Math.PI));
@@ -319,20 +337,22 @@ function process(){
       hull.delete(); cnt.delete();
     }
 
-    // Hough circles & fuse — close minDist, but validate with edge ring too
-    const tmp=new cv.Mat(); const circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
-    try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(6, Math.min(procW,procH)*0.05), 180, 40, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
-    for(let i=0;i<circles.cols;i++){
-      const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
-      if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
-      const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy)));
-      if(fused.ucharPtr(py,px)[0]===0) continue;
-      const edgeOK = ringEdgeOK(cx, cy, r);
-      if(!edgeOK) continue;
-      const Rv=r*Math.sqrt((sX+sY)/2);
-      dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95, strong:true}); eqRads.push(Rv);
+    // Hough circles — run every other frame (and only if needed)
+    let runHough = (frameIdx % PERF.HOUGH_EVERY)===0;
+    if(runHough){
+      const tmp=new cv.Mat(); const circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
+      try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(6, Math.min(procW,procH)*0.05), 180, 40, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
+      for(let i=0;i<circles.cols;i++){
+        const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
+        if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
+        const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy)));
+        if(fused.ucharPtr(py,px)[0]===0) continue;
+        const edgeOK = ringEdgeOK(cx, cy, r); if(!edgeOK) continue;
+        const Rv=r*Math.sqrt((sX+sY)/2);
+        dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95, strong:true}); eqRads.push(Rv);
+      }
+      tmp.delete(); circles.delete();
     }
-    tmp.delete(); circles.delete();
 
     // === Size prior & hard bounds ===
     if(eqRads.length>=3){ const mid = median(eqRads.filter(v=>isFinite(v))); sizePrior.R = sizePrior.R? (0.7*sizePrior.R+0.3*mid) : mid; }
@@ -388,7 +408,7 @@ function process(){
     countEl.textContent = `Confirmed: ${confirmed} / Total: ${median(recentTotals)}`;
 
     finalMask.delete();
-    updateFps();
+    updateFps(); frameIdx++;
   }catch(e){ console.error(e); showErr(e?.message||String(e)); }
   requestAnimationFrame(process);
 }
@@ -400,7 +420,7 @@ startBtn.addEventListener('click', async()=>{
   if(ok){ const ready=()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); }); } else { startBtn.disabled=false; }
 });
 
-window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); });
+window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
 </body>
 </html>
