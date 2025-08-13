@@ -408,7 +408,7 @@ function process(){
 
     const totalTracks = tracker.tracks.length;
     recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
-    const newText = `Confirmed: ${confirmed} / Total: ${median(recentTotals)}`;
+    const newText = `${median(recentTotals)}`;
     if (performance.now() >= recountFreezeUntil) {
       countEl.textContent = newText;
     }
