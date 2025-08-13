@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Lexieye – Live Pill Counter (Calibrated)</title>
+  <title>Lexieye – Live Pill Counter (Auto‑calibrating, single view)</title>
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet" />
   <style>
@@ -12,16 +12,12 @@
     h1{ text-align:center; font-size:2.4rem; color:var(--primary); margin:0 0 16px }
     .wrap{ max-width:1000px; margin:auto; border-radius:28px; padding:20px; background:var(--glass); border:1px solid var(--border-glass); backdrop-filter:blur(30px) }
     .row{ display:grid; grid-template-columns:1fr; gap:12px }
-    video,canvas{ width:100%; border-radius:18px; border:2px solid var(--primary) }
+    canvas{ width:100%; border-radius:18px; border:2px solid var(--primary) }
     .controls{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px }
     .btn{ background:var(--primary); color:#fff; border:none; border-radius:20px; padding:10px 16px; cursor:pointer }
     .btn[disabled]{ opacity:.6; cursor:not-allowed }
     .pill{ display:inline-block; padding:2px 6px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff }
     .err{ color:#b00020; font-size:.95rem }
-    .panel{ display:flex; flex-wrap:wrap; gap:14px; align-items:center }
-    label{ font-size:.92rem }
-    input[type="range"], input[type="number"], select{ padding:6px 8px; border-radius:10px; border:1px solid #bcd6ef }
-    .hint{ font-size:.9rem; opacity:.8 }
   </style>
 </head>
 <body>
@@ -29,50 +25,22 @@
 
   <div class="wrap">
     <div class="controls">
-      <button id="startBtn" class="btn">Enable Camera</button>
-      <button id="toggleBtn" class="btn" disabled>Start Live Count</button>
+      <button id="startBtn" class="btn">Enable Camera & Start</button>
       <span class="pill">Detected: <b id="count">0</b></span>
       <span class="pill" id="fps">0 fps</span>
     </div>
     <div class="err" id="err"></div>
 
     <div class="row">
-      <video id="video" playsinline muted></video>
-      <canvas id="canvas" title="Tip: Tap a pill to auto‑calibrate color/size"></canvas>
+      <!-- Single annotated view (no second screen). Video is hidden; we render to one canvas. -->
+      <video id="video" playsinline muted style="display:none"></video>
+      <canvas id="canvas"></canvas>
     </div>
-
-    <div class="panel" style="margin-top:12px">
-      <label>Mode
-        <select id="mode">
-          <option value="contours">Contours</option>
-          <option value="hough">Hough (round)</option>
-          <option value="watershed">Watershed (split)</option>
-        </select>
-      </label>
-      <label>Use color mask <input type="checkbox" id="useColor" checked></label>
-      <label>HSV Hue <input type="range" id="hCenter" min="0" max="179" value="0"> ± <input type="range" id="hTol" min="0" max="30" value="10"></label>
-      <label>Sat ≤ <input type="range" id="sMax" min="0" max="255" value="60"></label>
-      <label>Val ≥ <input type="range" id="vMin" min="0" max="255" value="180"></label>
-      <label>Min size % <input type="number" id="minPct" value="0.01" step="0.005" min="0.001" max="0.2" style="width:80px"></label>
-      <label>Max size % <input type="number" id="maxPct" value="0.30" step="0.01" min="0.05" max="0.9" style="width:80px"></label>
-      <label>Invert BW <input type="checkbox" id="invert"></label>
-      <label>Debug
-        <select id="debug">
-          <option value="none">None</option>
-          <option value="mask">Color mask</option>
-          <option value="thresh">Threshold</option>
-          <option value="morph">Morph</option>
-          <option value="edges">Edges</option>
-        </select>
-      </label>
-    </div>
-    <div class="hint">Tap on a pill in the preview to auto‑set HSV and size. Keep background plain, avoid reflections, and fill more of the frame with pills.</div>
   </div>
 
   <script>
-    // UI
+    // Minimal UI (no user clicks for calibration). Single annotated canvas output.
     const startBtn=document.getElementById('startBtn');
-    const toggleBtn=document.getElementById('toggleBtn');
     const errEl=document.getElementById('err');
     const video=document.getElementById('video');
     const canvas=document.getElementById('canvas');
@@ -80,26 +48,13 @@
     const countEl=document.getElementById('count');
     const fpsEl=document.getElementById('fps');
 
-    const modeEl=document.getElementById('mode');
-    const useColorEl=document.getElementById('useColor');
-    const hCenterEl=document.getElementById('hCenter');
-    const hTolEl=document.getElementById('hTol');
-    const sMaxEl=document.getElementById('sMax');
-    const vMinEl=document.getElementById('vMin');
-    const minPctEl=document.getElementById('minPct');
-    const maxPctEl=document.getElementById('maxPct');
-    const invertEl=document.getElementById('invert');
-    const debugEl=document.getElementById('debug');
-
-    // State
-    let stream=null, running=false, lastTick=performance.now(), frames=0;
-    let recentCounts=[]; // for median debounce
+    let stream=null, running=false, lastTick=performance.now(), frames=0, warmup=30, frameIndex=0;
+    let recentCounts=[]; // median smoothing
 
     // OpenCV Mats
-    let src, rgb, hsv, gray, blur, thresh, morph, kernel, contours, hierarchy, edges;
+    let src, rgb, gray, blur, mask, morph, edges, kernel, contours, hierarchy;
 
     function showErr(msg){ errEl.textContent=msg; console.error(msg); }
-
     function secureContextCheck(){
       if (location.protocol!=='https:' && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
         showErr('Camera requires HTTPS or localhost.');
@@ -109,7 +64,7 @@
     async function startCamera(){
       errEl.textContent='';
       const tries=[
-        {video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}, focusMode:'continuous'}, audio:false},
+        {video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}}, audio:false},
         {video:true, audio:false}
       ];
       try{
@@ -121,9 +76,8 @@
         try{
           stream=await navigator.mediaDevices.getUserMedia(c);
           video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play();
-          // Try to lock exposure if supported (quietly)
-          const track=stream.getVideoTracks()[0];
-          track.applyConstraints?.({advanced:[{exposureMode:'continuous', whiteBalanceMode:'continuous'}]}).catch(()=>{});
+          // Hint exposure/white balance (best‑effort)
+          stream.getVideoTracks()[0]?.applyConstraints?.({advanced:[{exposureMode:'continuous', whiteBalanceMode:'continuous'}]}).catch(()=>{});
           return true;
         }catch(e){ console.warn('gUM fail',c,e); }
       }
@@ -132,13 +86,12 @@
     }
 
     function initMats(w,h){
-      [src,rgb,hsv,gray,blur,thresh,morph,kernel,contours,hierarchy,edges].forEach(m=>{try{m&&m.delete()}catch{}});
+      [src,rgb,gray,blur,mask,morph,edges,kernel,contours,hierarchy].forEach(m=>{ try{ m&&m.delete(); }catch{} });
       src=new cv.Mat(h,w,cv.CV_8UC4);
       rgb=new cv.Mat(h,w,cv.CV_8UC3);
-      hsv=new cv.Mat(h,w,cv.CV_8UC3);
       gray=new cv.Mat(h,w,cv.CV_8UC1);
       blur=new cv.Mat(h,w,cv.CV_8UC1);
-      thresh=new cv.Mat(h,w,cv.CV_8UC1);
+      mask=new cv.Mat(h,w,cv.CV_8UC1);
       morph=new cv.Mat(h,w,cv.CV_8UC1);
       edges=new cv.Mat(h,w,cv.CV_8UC1);
       kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
@@ -146,32 +99,42 @@
       hierarchy=new cv.Mat();
     }
 
-    function percentToArea(w,h,p){ return Math.max(1, Math.round(w*h*(p||0.02))); }
-
     function median(arr){ const a=[...arr].sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
-
     function updateFps(){ frames++; const now=performance.now(); if(now-lastTick>=1000){ fpsEl.textContent=`${frames} fps`; frames=0; lastTick=now; } }
 
-    function buildMask(w,h){
-      // Color mask (HSV): default tuned for white/light pills; tap to calibrate adjusts sliders
-      if(!useColorEl.checked){
-        // grayscale threshold path
-        const type=(invertEl.checked?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
-        cv.threshold(blur, thresh, 0, 255, type);
-        cv.morphologyEx(thresh, morph, cv.MORPH_OPEN, kernel);
-        cv.morphologyEx(morph, morph, cv.MORPH_CLOSE, kernel);
-        return morph;
+    // --- AUTO CALIBRATION LOGIC ---
+    // Automatically pick polarity (bright‑on‑dark vs dark‑on‑bright) and size range from observed components.
+    const auto = { invert:false, minAreaPx:200, maxAreaPx:20000 };
+
+    function choosePolarityAndThreshold(){
+      // Try both polarities with Otsu; keep the one yielding more mid‑sized components
+      const tests = [cv.THRESH_BINARY+cv.THRESH_OTSU, cv.THRESH_BINARY_INV+cv.THRESH_OTSU];
+      let best={score:-1, invert:false, mask:null};
+      for(const t of tests){
+        const tmp=new cv.Mat();
+        cv.threshold(blur, tmp, 0, 255, t);
+        const cleaned=new cv.Mat();
+        cv.morphologyEx(tmp, cleaned, cv.MORPH_OPEN, kernel);
+        cv.morphologyEx(cleaned, cleaned, cv.MORPH_CLOSE, kernel);
+        const vec=new cv.MatVector(), hier=new cv.Mat();
+        cv.findContours(cleaned, vec, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        const total = cleaned.rows*cleaned.cols; const lo=total*0.002, hi=total*0.25;
+        let good=0; let areas=[];
+        for(let i=0;i<vec.size();i++){ const a=cv.contourArea(vec.get(i)); if(a>lo && a<hi){ good++; areas.push(a); } }
+        if(good>best.score){ if(best.mask) best.mask.delete(); best={score:good, invert:(t&cv.THRESH_BINARY_INV)!==0, mask:cleaned}; }
+        else { cleaned.delete(); }
+        tmp.delete(); vec.delete(); hier.delete();
       }
-      const hC=+hCenterEl.value, hT=+hTolEl.value, sM=+sMaxEl.value, vM=+vMinEl.value;
-      const lower = new cv.Mat(h, w, cv.CV_8UC3, new cv.Scalar(Math.max(0,hC-hT), 0, vM));
-      const upper = new cv.Mat(h, w, cv.CV_8UC3, new cv.Scalar(Math.min(179,hC+hT), sM, 255));
-      const mask = new cv.Mat();
-      cv.inRange(hsv, lower, upper, mask);
-      // Clean up speckle
-      cv.morphologyEx(mask, morph, cv.MORPH_OPEN, kernel);
-      cv.morphologyEx(morph, morph, cv.MORPH_CLOSE, kernel);
-      lower.delete(); upper.delete(); mask.delete();
-      return morph;
+      auto.invert = best.invert;
+      mask.delete(); mask = best.mask; // keep best mask
+
+      // Dynamic area bounds 10th–90th percentile
+      const vec2=new cv.MatVector(), hier2=new cv.Mat();
+      cv.findContours(mask, vec2, hier2, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      let areas=[]; for(let i=0;i<vec2.size();i++){ areas.push(cv.contourArea(vec2.get(i))); }
+      areas.sort((a,b)=>a-b);
+      if(areas.length){ const q=p=>areas[Math.max(0,Math.min(areas.length-1,Math.floor(p*(areas.length-1))))]; auto.minAreaPx=Math.max(50,q(0.10)); auto.maxAreaPx=Math.max(auto.minAreaPx+100,q(0.90)); }
+      vec2.delete(); hier2.delete();
     }
 
     function processFrame(){
@@ -182,111 +145,65 @@
       ctx2d.drawImage(video,0,0,w,h);
       cv.imread(canvas, src);
       cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
-      cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
       cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+
+      // Denoise
       cv.GaussianBlur(gray, blur, new cv.Size(5,5), 1.2, 1.2);
 
-      const mask = buildMask(w,h);
-
-      const minA = percentToArea(w,h, parseFloat(minPctEl.value));
-      const maxA = percentToArea(w,h, parseFloat(maxPctEl.value));
-      let count=0;
-
-      const mode = modeEl.value;
-      if(mode==='hough'){
-        const tmp = new cv.Mat();
-        cv.bitwise_and(blur, blur, tmp, morph);
-        const circles = new cv.Mat();
-        try{
-          cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1, 20, 120, 25, 5, Math.floor(Math.min(w,h)*0.25));
-          for(let i=0;i<circles.cols;i++){
-            const x=circles.data32F[i*3], y=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
-            const a=Math.PI*r*r; if(a>=minA && a<=maxA){ cv.circle(rgb, new cv.Point(x,y), r, [0,255,0,255], 3); count++; }
-          }
-        } finally{ circles.delete(); tmp.delete(); }
-      } else if(mode==='watershed'){
-        // Use distance transform to split touching components inside mask
-        const dt = new cv.Mat();
-        cv.distanceTransform(morph, dt, cv.DIST_L2, 3);
-        const dtNorm = new cv.Mat(); cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
-        const fg = new cv.Mat(); cv.threshold(dtNorm, fg, 0.35, 1.0, cv.THRESH_BINARY);
-        fg.convertTo(fg, cv.CV_8U, 255);
-        cv.findContours(fg, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-        for(let i=0;i<contours.size();i++){
-          const cnt=contours.get(i); const area=cv.contourArea(cnt);
-          if(area>=minA && area<=maxA){
-            const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
-            const r=Math.max(4, Math.sqrt(area/Math.PI)|0); cv.circle(rgb, new cv.Point(cx,cy), r, [0,255,0,255], 3); count++;
-          }
-          cnt.delete();
-        }
-        dt.delete(); dtNorm.delete(); fg.delete();
+      // Auto‑calibrate periodically and during warm‑up
+      if (frameIndex < warmup || frameIndex % 30 === 0){
+        choosePolarityAndThreshold();
       } else {
-        // Contours + convexity, also leverage Canny edges to reject background
-        cv.Canny(blur, edges, 60, 140);
-        // combine edges with mask to keep only masked edges
-        const maskedEdges = new cv.Mat();
-        cv.bitwise_and(edges, morph, maskedEdges);
-        cv.findContours(maskedEdges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-        for(let i=0;i<contours.size();i++){
-          const cnt=contours.get(i); const area=cv.contourArea(cnt);
-          if(area<minA || area>maxA){ cnt.delete(); continue; }
-          const peri=cv.arcLength(cnt,true); const circ=(4*Math.PI*area)/(peri*peri+1e-6);
-          const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
-          if(circ>=0.45 && solid>=0.8){
-            const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
-            const r=Math.max(4, Math.sqrt(area/Math.PI)|0); cv.circle(rgb, new cv.Point(cx,cy), r, [0,255,0,255], 3); count++;
-          }
-          hull.delete(); cnt.delete();
+        const type=(auto.invert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
+        cv.threshold(blur, mask, 0, 255, type);
+        cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel);
+        cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+      }
+
+      // Edge assist + mask intersection
+      cv.Canny(blur, edges, 60, 140);
+      const maskedEdges = new cv.Mat();
+      cv.bitwise_and(edges, mask, maskedEdges);
+
+      // Contours & shape checks
+      cv.findContours(maskedEdges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      let count=0;
+      for(let i=0;i<contours.size();i++){
+        const cnt=contours.get(i); const area=cv.contourArea(cnt);
+        if(area<auto.minAreaPx || area>auto.maxAreaPx){ cnt.delete(); continue; }
+        const peri=cv.arcLength(cnt,true);
+        const circ=(4*Math.PI*area)/(peri*peri+1e-6);
+        const hull=new cv.Mat(); cv.convexHull(cnt,hull);
+        const solid=area/Math.max(cv.contourArea(hull),1e-6);
+        if(circ>=0.45 && solid>=0.8){
+          const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
+          const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
+          cv.circle(rgb, new cv.Point(cx,cy), r, [0,255,0,255], 3); count++;
         }
-        maskedEdges.delete();
+        hull.delete(); cnt.delete();
       }
 
-      // Debug output
-      switch(debugEl.value){
-        case 'mask': cv.imshow(canvas, morph); break;
-        case 'thresh': cv.imshow(canvas, thresh); break; // (from grayscale path)
-        case 'morph': cv.imshow(canvas, morph); break;
-        case 'edges': cv.imshow(canvas, edges); break;
-        default: cv.imshow(canvas, rgb); break;
-      }
+      // Single annotated canvas
+      cv.imshow(canvas, rgb);
 
-      // Debounce with median of last 7 frames to avoid flicker
+      // Stable count via median of last 7 frames
       recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
-      const stable = median(recentCounts);
-      countEl.textContent=stable;
+      countEl.textContent = median(recentCounts);
 
-      updateFps();
+      updateFps(); frameIndex++;
+      maskedEdges.delete();
       requestAnimationFrame(processFrame);
     }
 
-    function setRunning(on){ running=on; toggleBtn.textContent=on?'Stop Live Count':'Start Live Count'; if(on) requestAnimationFrame(processFrame); }
+    function setRunning(on){ running=on; if(on) requestAnimationFrame(processFrame); }
 
-    // Tap to calibrate color + size
-    canvas.addEventListener('click', (e)=>{
-      const rect=canvas.getBoundingClientRect();
-      const x=Math.floor((e.clientX-rect.left)/rect.width*canvas.width);
-      const y=Math.floor((e.clientY-rect.top)/rect.height*canvas.height);
-      // sample 9x9 region average HSV
-      const size=9; const x0=Math.max(0,x-size), y0=Math.max(0,y-size);
-      const roi=hsv.roi(new cv.Rect(x0,y0, Math.min(size*2+1, hsv.cols-x0), Math.min(size*2+1, hsv.rows-y0)));
-      const mean = cv.mean(roi); roi.delete();
-      const h=Math.round(mean[0]), s=Math.round(mean[1]), v=Math.round(mean[2]);
-      hCenterEl.value = h; hTolEl.value = 12; sMaxEl.value = Math.min(255, Math.max(40, s+30)); vMinEl.value = Math.max(80, v-30);
-      useColorEl.checked = true;
-      // estimate size by finding nearest contour around the point next frame; here we just widen minPct a bit
-      minPctEl.value = (parseFloat(minPctEl.value)||0.01);
-    });
+    startBtn.addEventListener('click', async()=>{ secureContextCheck(); const ok=await startCamera(); if(ok){ startBtn.disabled=true; setRunning(true); }});
 
-    // Buttons
-    startBtn.addEventListener('click', async()=>{ secureContextCheck(); const ok=await startCamera(); if(ok){ toggleBtn.disabled=false; startBtn.disabled=true; }});
-    toggleBtn.addEventListener('click', ()=> setRunning(!running));
-
-    // OpenCV ready
+    // OpenCV gate
     window.cv=window.cv||{}; cv['onRuntimeInitialized']=()=>{ console.log('OpenCV ready'); };
 
     // Cleanup
-    window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,rgb,hsv,gray,blur,thresh,morph,kernel,contours,hierarchy,edges].forEach(m=>{try{m&&m.delete()}catch{}}); });
+    window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,rgb,gray,blur,mask,morph,edges,kernel,contours,hierarchy].forEach(m=>{try{m&&m.delete()}catch{}}); });
 
     secureContextCheck();
   </script>
