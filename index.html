@@ -58,7 +58,7 @@
     const wctx=work.getContext('2d');
 
     // OpenCV Mats
-    let src, gray, blur, mask, edges, kernel, contours, hierarchy;
+    let src, gray, blur, mask, morph, edges, kernel, contours, hierarchy, dt, markers;
     let clahe=null; // contrast enhancer
 
     function showErr(msg){ errEl.textContent=msg; console.error(msg); }
@@ -103,13 +103,16 @@
     }
 
     function initMats(w,h){
-      [src,gray,blur,mask,edges,kernel,contours,hierarchy].forEach(m=>{ try{ m&&m.delete(); }catch{} });
+      [src,gray,blur,mask,morph,edges,kernel,contours,hierarchy,dt,markers].forEach(m=>{ try{ m&&m.delete(); }catch{} });
       if (clahe){ try{ clahe.delete(); }catch{}; clahe=null; }
       src=new cv.Mat(h,w,cv.CV_8UC4);
       gray=new cv.Mat(h,w,cv.CV_8UC1);
       blur=new cv.Mat(h,w,cv.CV_8UC1);
       mask=new cv.Mat(h,w,cv.CV_8UC1);
+      morph=new cv.Mat(h,w,cv.CV_8UC1);
       edges=new cv.Mat(h,w,cv.CV_8UC1);
+      dt=new cv.Mat(h,w,cv.CV_32F);
+      markers=new cv.Mat(h,w,cv.CV_32S);
       kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
       contours=new cv.MatVector();
       hierarchy=new cv.Mat();
@@ -158,13 +161,26 @@
       vec2.delete(); hier2.delete();
     }
 
+    function scaleOverlayToVideo(){
+      const w=video.videoWidth||640, h=video.videoHeight||480;
+      const dpr = window.devicePixelRatio || 1;
+      // CSS size matches video element size; canvas internal pixels scaled by dpr
+      const rect = video.getBoundingClientRect();
+      overlay.style.width = rect.width + 'px';
+      overlay.style.height = rect.height + 'px';
+      overlay.width = Math.round(w * dpr);
+      overlay.height = Math.round(h * dpr);
+      octx.setTransform(dpr,0,0,dpr,0,0); // draw in video pixel coords
+      // work/offscreen
+      work.width = w; work.height = h;
+      initMats(w,h);
+    }
+
     function processFrame(){
       if(!running) return;
       const w=video.videoWidth||640, h=video.videoHeight||480;
       if(!w||!h){ requestAnimationFrame(processFrame); return; }
-      // Resize overlay and work canvas to video size
-      if (overlay.width !== w || overlay.height !== h){ overlay.width=w; overlay.height=h; }
-      if (work.width !== w || work.height !== h){ work.width=w; work.height=h; initMats(w,h); }
+      if (work.width !== w || work.height !== h) { scaleOverlayToVideo(); }
 
       // Draw the live video frame into the OFFSCREEN work canvas
       wctx.drawImage(video,0,0,w,h);
@@ -188,14 +204,21 @@
         cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
       }
 
-      // Edge assist + mask intersection
-      cv.Canny(blur, edges, 50, 130);
-      const maskedEdges = new cv.Mat();
-      cv.bitwise_and(edges, mask, maskedEdges);
+      // Optional splitting of touching pills using distance transform (lightweight)
+      cv.distanceTransform(mask, dt, cv.DIST_L2, 3);
+      const dtNorm = new cv.Mat();
+      cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
+      const fg = new cv.Mat();
+      cv.threshold(dtNorm, fg, 0.35, 1.0, cv.THRESH_BINARY);
+      fg.convertTo(fg, cv.CV_8U, 255);
 
-      // Find pills and collect their circles for overlay
-      cv.findContours(maskedEdges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-      let count=0; const rings=[];
+      // Final mask for contouring: intersect foreground with original mask to keep shapes
+      const finalMask = new cv.Mat();
+      cv.bitwise_and(mask, fg, finalMask);
+
+      // Find pills and collect their centers for overlay
+      cv.findContours(finalMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      let count=0; const dots=[]; const rings=[];
       for(let i=0;i<contours.size();i++){
         const cnt=contours.get(i); const area=cv.contourArea(cnt);
         if(area<auto.minAreaPx || area>auto.maxAreaPx){ cnt.delete(); continue; }
@@ -206,7 +229,7 @@
         if(circ>=0.42 && solid>=0.78){
           const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
           const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
-          rings.push({cx,cy,r}); count++;
+          dots.push({cx,cy}); rings.push({cx,cy,r}); count++;
         }
         hull.delete(); cnt.delete();
       }
@@ -214,16 +237,17 @@
       // Draw overlay (transparent) on top of the live video
       octx.clearRect(0,0,overlay.width, overlay.height);
       octx.lineWidth = 3; octx.strokeStyle = 'rgba(0,255,0,0.95)';
-      for(const {cx,cy,r} of rings){
-        octx.beginPath(); octx.arc(cx, cy, r, 0, Math.PI*2); octx.stroke();
-      }
+      for(const {cx,cy,r} of rings){ octx.beginPath(); octx.arc(cx, cy, r, 0, Math.PI*2); octx.stroke(); }
+      // Center DOT on each pill
+      octx.fillStyle = 'rgba(255,0,0,0.95)';
+      for(const {cx,cy} of dots){ octx.beginPath(); octx.arc(cx, cy, 4, 0, Math.PI*2); octx.fill(); }
 
       // Stable count via median of last 7 frames
       recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
       countEl.textContent = median(recentCounts);
 
       updateFps(); frameIndex++;
-      maskedEdges.delete();
+      dtNorm.delete(); fg.delete(); finalMask.delete();
       requestAnimationFrame(processFrame);
     }
 
@@ -237,11 +261,11 @@
       secureContextCheck();
       startBtn.disabled=true;
       const ok=await startCamera();
-      if(ok){ setRunning(true); } else { startBtn.disabled=false; }
+      if(ok){ scaleOverlayToVideo(); setRunning(true); } else { startBtn.disabled=false; }
     });
 
     // Cleanup
-    window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,gray,blur,mask,edges,kernel,contours,hierarchy].forEach(m=>{try{m&&m.delete()}catch{}}); if(clahe){try{clahe.delete()}catch{}} });
+    window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,gray,blur,mask,morph,edges,kernel,contours,hierarchy,dt,markers].forEach(m=>{try{m&&m.delete()}catch{}}); if(clahe){try{clahe.delete()}catch{}} });
 
     secureContextCheck();
   </script>
