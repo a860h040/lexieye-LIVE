@@ -18,9 +18,9 @@
     .err{ color:#b00020; font-size:.95rem }
 
     /* ===== Camera feed container ===== */
-    .feed{ position:relative; display:inline-block; /* will be sized to the video pixels */ }
-    video{ display:block; border-radius:18px; border:2px solid var(--primary); }
-    #overlay{ position:absolute; left:0; top:0; pointer-events:none; border-radius:18px; }
+    .feed{ position:relative; display:block; width:100%; max-width:960px; margin-top:10px }
+    video{ display:block; width:100%; height:auto; border-radius:18px; border:2px solid var(--primary) }
+    #overlay{ position:absolute; left:0; top:0; pointer-events:none; border-radius:18px; width:100%; height:100% }
   </style>
 </head>
 <body>
@@ -185,8 +185,9 @@
     const chs = new cv.MatVector(); cv.split(hsv, chs);
     const S = chs.get(1), V = chs.get(2);
     const meanV = cv.mean(V)[0];
-    const vMin = Math.min(255, Math.max(115, Math.round(meanV + 18)));
-    const sMax = 90; // low saturation (white/light)
+    // Slightly softer thresholds so real pills pass even in dimmer light
+    const vMin = Math.min(255, Math.max(105, Math.round(meanV + 12)));
+    const sMax = 110; // allow a bit more saturation
     const vMask = new cv.Mat(); const sMask = new cv.Mat();
     cv.threshold(V, vMask, vMin, 255, cv.THRESH_BINARY);
     cv.threshold(S, sMask, sMax, 255, cv.THRESH_BINARY_INV);
@@ -196,15 +197,19 @@
     return out;
   }
 
-  function scaleToVideoAndOverlay(){
-    const w = video.videoWidth||640, h = video.videoHeight||480;
-    feed.style.width = w + 'px'; feed.style.height = h + 'px';
-    video.style.width = w + 'px'; video.style.height = h + 'px';
-    overlay.width = w * (window.devicePixelRatio||1); overlay.height = h * (window.devicePixelRatio||1);
-    overlay.style.width = w + 'px'; overlay.style.height = h + 'px';
-    const sx = (overlay.width)/(w), sy = (overlay.height)/(h);
+  function syncOverlayToVideo(){
+    // Map overlay pixels 1:1 to the camera's native pixels; display is scaled via CSS.
+    const vw = video.videoWidth || 640, vh = video.videoHeight || 480;
+    const dpr = window.devicePixelRatio || 1;
+    const rect = video.getBoundingClientRect();
+    overlay.style.width = rect.width + 'px';
+    overlay.style.height = rect.height + 'px';
+    overlay.width = Math.round(vw * dpr);
+    overlay.height = Math.round(vh * dpr);
+    // draw using video pixel coords
+    const sx = overlay.width / vw, sy = overlay.height / vh;
     octx.setTransform(sx,0,0,sy,0,0);
-    work.width = w; work.height = h; initMats(w,h);
+    work.width = vw; work.height = vh; initMats(vw,vh);
   }
 
   function houghRadiusEstimate(){
@@ -230,7 +235,7 @@
     try{
       const w=video.videoWidth||640, h=video.videoHeight||480;
       if(!w||!h){ requestAnimationFrame(processFrame); return; }
-      if (work.width !== w || work.height !== h) { scaleToVideoAndOverlay(); }
+      if (overlay.width === 0 || work.width !== w || work.height !== h) { syncOverlayToVideo(); }
 
       // Read frame
       wctx.drawImage(video,0,0,w,h);
@@ -266,7 +271,7 @@
       const finalMask = new cv.Mat(); cv.bitwise_and(fused, fg, finalMask);
 
       // Edges
-      cv.Canny(blur, edges, 160, 260);
+      cv.Canny(blur, edges, 140, 240);
 
       // Contours (primary path)
       contours.delete(); contours=new cv.MatVector();
@@ -285,8 +290,8 @@
         const nz=cv.countNonZero(finalMask.roi(rect));
         const coverage = nz/Math.max(1, rect.width*rect.height);
         const u = uniformityScoreRect(rect);
-        const passGeom = CIRCLE_ONLY ? (circ>=0.72 && solid>=0.90) : (circ>=0.48 && solid>=0.80);
-        if(passGeom && coverage>0.45 && u>0.5){
+        const passGeom = CIRCLE_ONLY ? (circ>=0.66 && solid>=0.88) : (circ>=0.48 && solid>=0.80);
+        if(passGeom && coverage>0.35 && u>0.45){
           const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
           const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
           dets.push({cx,cy,r,score:circ*solid});
@@ -299,7 +304,7 @@
       const tmp = new cv.Mat(); cv.GaussianBlur(blur, tmp, new cv.Size(3,3), 1.0, 1.0);
       let minR=6, maxR=Math.max(8, Math.round(Math.min(w,h)*0.25));
       if (CAL.medianR){ minR=Math.max(5, Math.round(CAL.medianR*0.80)); maxR=Math.round(CAL.medianR*1.25); }
-      try{ cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1.35, Math.max(26, minR*2), 220, 72, minR, maxR); }catch{}
+      try{ cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1.3, Math.max(32, minR*2.2), 180, 42, minR, maxR); }catch{}
       for(let i=0;i<circles.cols;i++){
         const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
         if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
@@ -314,7 +319,7 @@
         const coverage = cv.countNonZero(mROI)/(rect.width*rect.height);
         gROI.delete(); mROI.delete(); m.delete(); s.delete();
         // Require bright, uniform interior with enough mask support
-        if (coverage>0.55 && stdG<28 && meanG>cv.mean(gray)[0]+12){
+        if (coverage>0.40 && stdG<35 && meanG>cv.mean(gray)[0]+6){
           dets.push({cx,cy,r:Math.max(4,r), score:0.96});
         }
       }
@@ -366,6 +371,15 @@
 
   startBtn.addEventListener('click', async()=>{
     secureContextCheck();
+    startBtn.disabled=true;
+    const ok=await startCamera();
+    if(ok){
+      if (video.readyState >= 1) { syncOverlayToVideo(); }
+      else { video.addEventListener('loadedmetadata', syncOverlayToVideo, { once:true }); }
+      setRunning(true);
+      window.addEventListener('resize', ()=>{ if (video.videoWidth) syncOverlayToVideo(); });
+    } else { startBtn.disabled=false; }
+  });
     startBtn.disabled=true;
     const ok=await startCamera();
     if(ok){ scaleToVideoAndOverlay(); setRunning(true); } else { startBtn.disabled=false; }
