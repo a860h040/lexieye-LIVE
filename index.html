@@ -41,7 +41,8 @@
   </div>
 
   <script>
-  // Camera-visible UI with transparent overlay; one live view. Improved accuracy + per-pill dots & labels.
+  // Live camera + overlay — accuracy-focused pipeline (illumination correction, multi-mask fusion, watershed split,
+  // ellipse scoring, temporal confirmation, per-pill dot+ID).
   const startBtn=document.getElementById('startBtn');
   const errEl=document.getElementById('err');
   const video=document.getElementById('video');
@@ -53,12 +54,12 @@
   let stream=null, running=false, lastTick=performance.now(), frames=0, warmup=30, frameIndex=0;
   let recentCounts=[]; // median smoothing
 
-  // Offscreen work canvas for OpenCV (processing only)
+  // Offscreen work canvas
   const work=document.createElement('canvas');
   const wctx=work.getContext('2d');
 
   // OpenCV Mats
-  let src, rgba, hsv, gray, blur, mask, morph, edges, kernel, contours, hierarchy, dt;
+  let src, rgba, hsv, gray, blur, mask, edges, kernelSmall, kernelBig, contours, hierarchy, dt;
   let clahe=null; // contrast enhancer
 
   function showErr(msg){ errEl.textContent=msg; console.error(msg); }
@@ -85,7 +86,7 @@
         stream=await navigator.mediaDevices.getUserMedia(c);
         video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play();
 
-        // Try exposure/white balance/torch if supported
+        // Exposure/white balance/torch if supported
         const track = stream.getVideoTracks()[0];
         const caps  = track.getCapabilities ? track.getCapabilities() : {};
         const adv = [];
@@ -101,8 +102,9 @@
     return false;
   }
 
+  function odd(n){ return (n % 2) ? n : n+1; }
   function initMats(w,h){
-    [src,rgba,hsv,gray,blur,mask,morph,edges,kernel,contours,hierarchy,dt].forEach(m=>{ try{ m&&m.delete(); }catch{} });
+    [src,rgba,hsv,gray,blur,mask,edges,kernelSmall,kernelBig,contours,hierarchy,dt].forEach(m=>{ try{ m&&m.delete(); }catch{} });
     if (clahe){ try{ clahe.delete(); }catch{}; clahe=null; }
     src=new cv.Mat(h,w,cv.CV_8UC4);
     rgba=new cv.Mat(h,w,cv.CV_8UC3);
@@ -110,54 +112,88 @@
     gray=new cv.Mat(h,w,cv.CV_8UC1);
     blur=new cv.Mat(h,w,cv.CV_8UC1);
     mask=new cv.Mat(h,w,cv.CV_8UC1);
-    morph=new cv.Mat(h,w,cv.CV_8UC1);
     edges=new cv.Mat(h,w,cv.CV_8UC1);
     dt=new cv.Mat(h,w,cv.CV_32F);
-    kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(Math.max(3, Math.round(w*0.006)), Math.max(3, Math.round(h*0.006))));
+    const ks = odd(Math.max(3, Math.round(Math.min(w,h)*0.01))); // local cleanup
+    const kb = odd(Math.max(15, Math.round(Math.min(w,h)*0.08))); // shade removal / split
+    kernelSmall=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(ks,ks));
+    kernelBig  =cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kb,kb));
     contours=new cv.MatVector();
     hierarchy=new cv.Mat();
-    try { clahe = cv.createCLAHE(2.0, new cv.Size(8,8)); } catch { clahe = null; }
+    try { clahe = cv.createCLAHE(2.2, new cv.Size(8,8)); } catch { clahe = null; }
   }
 
+  // Simple tracker with confirmation
   const tracker = { nextId:1, tracks:[] };
   function assignTracks(dets){
-    // Simple nearest-neighbor association
-    const maxDist = 0.6 * Math.min(overlay.width, overlay.height) / (window.devicePixelRatio||1) * 0.04; // ~4% of min side
-    const used = new Set();
+    const maxDist = Math.min(overlay.width, overlay.height) / (window.devicePixelRatio||1) * 0.05; // 5% of min side
+    const now = performance.now();
     for(const t of tracker.tracks){ t.matched=false; }
+
     for(const d of dets){
       let best=null, bestDist=1e9;
       for(const t of tracker.tracks){
-        const dx = d.cx - t.x; const dy = d.cy - t.y; const dist = Math.hypot(dx,dy);
+        const dist = Math.hypot(d.cx - t.x, d.cy - t.y);
         if (dist < bestDist && dist < maxDist) { best=t; bestDist=dist; }
       }
-      if (best){ best.x = 0.7*best.x + 0.3*d.cx; best.y = 0.7*best.y + 0.3*d.cy; best.r = 0.7*best.r + 0.3*d.r; best.seen=performance.now(); best.matched=true; d.id=best.id; }
-      else { tracker.tracks.push({ id:tracker.nextId++, x:d.cx, y:d.cy, r:d.r, seen:performance.now(), matched:true }); d.id=tracker.nextId-1; }
+      if (best){
+        best.x = 0.7*best.x + 0.3*d.cx; best.y = 0.7*best.y + 0.3*d.cy; best.r = 0.7*best.r + 0.3*d.r;
+        best.seen = now; best.matched=true; best.age = (best.age||0)+1; d.id=best.id; d.age=best.age;
+      } else {
+        tracker.tracks.push({ id:tracker.nextId++, x:d.cx, y:d.cy, r:d.r, seen:now, matched:true, age:1 });
+        d.id=tracker.nextId-1; d.age=1;
+      }
     }
-    // prune old
-    const now=performance.now();
+    // prune stale
     tracker.tracks = tracker.tracks.filter(t => now - t.seen < 1200);
   }
 
   function median(arr){ const a=[...arr].sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
   function updateFps(){ frames++; const now=performance.now(); if(now-lastTick>=1000){ fpsEl.textContent=`${frames} fps`; frames=0; lastTick=now; } }
 
-  // AUTO calibration
+  // AUTO calibration & enhancement
   const auto = { invert:false, minAreaPx:200, maxAreaPx:20000 };
-  function autoBrighten(intensityMean){
-    if (intensityMean < 60) { cv.convertScaleAbs(gray, gray, 1.6, 12); }
-    else if (intensityMean < 90) { cv.convertScaleAbs(gray, gray, 1.3, 6); }
-    try { if (clahe) { clahe.apply(gray, gray); } else { cv.equalizeHist(gray, gray); } } catch {}
+
+  function enhanceIllumination(){
+    // Top-hat + Black-hat to remove uneven lighting: enhanced = gray + tophat - blackhat
+    const opened = new cv.Mat(); const closed = new cv.Mat();
+    cv.morphologyEx(gray, opened, cv.MORPH_OPEN, kernelBig);
+    cv.morphologyEx(gray, closed, cv.MORPH_CLOSE, kernelBig);
+    const tophat = new cv.Mat(); const blackhat = new cv.Mat();
+    cv.subtract(gray, opened, tophat);
+    cv.subtract(closed, gray, blackhat);
+    const enhanced = new cv.Mat();
+    cv.add(gray, tophat, enhanced);
+    cv.subtract(enhanced, blackhat, enhanced);
+    // Contrast
+    try { if (clahe) { clahe.apply(enhanced, enhanced); } else { cv.equalizeHist(enhanced, enhanced); } } catch {}
+    opened.delete(); closed.delete(); tophat.delete(); blackhat.delete();
+    return enhanced;
   }
-  function choosePolarityAndThreshold(){
+
+  function hsvLightMask(){
+    const chs = new cv.MatVector(); cv.split(hsv, chs);
+    const S = chs.get(1), V = chs.get(2);
+    const meanV = cv.mean(V)[0];
+    const vMin = Math.min(255, Math.max(120, Math.round(meanV + 20)));
+    const sMax = 80; // low saturation (white/light)
+    const vMask = new cv.Mat(); const sMask = new cv.Mat();
+    cv.threshold(V, vMask, vMin, 255, cv.THRESH_BINARY);
+    cv.threshold(S, sMask, sMax, 255, cv.THRESH_BINARY_INV);
+    const out = new cv.Mat(); cv.bitwise_and(vMask, sMask, out);
+    vMask.delete(); sMask.delete(); S.delete(); V.delete(); chs.delete();
+    return out;
+  }
+
+  function choosePolarityAndThreshold(enhanced){
     const tests = [cv.THRESH_BINARY+cv.THRESH_OTSU, cv.THRESH_BINARY_INV+cv.THRESH_OTSU];
     let best={score:-1, invert:false, mask:null};
     for(const t of tests){
       const tmp=new cv.Mat();
-      cv.threshold(blur, tmp, 0, 255, t);
+      cv.threshold(enhanced, tmp, 0, 255, t);
       const opened=new cv.Mat();
-      cv.morphologyEx(tmp, opened, cv.MORPH_OPEN, kernel);
-      cv.morphologyEx(opened, opened, cv.MORPH_CLOSE, kernel);
+      cv.morphologyEx(tmp, opened, cv.MORPH_OPEN, kernelSmall);
+      cv.morphologyEx(opened, opened, cv.MORPH_CLOSE, kernelSmall);
       const vec=new cv.MatVector(), hier=new cv.Mat();
       cv.findContours(opened, vec, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
       const total = opened.rows*opened.cols; const lo=total*0.0015, hi=total*0.35;
@@ -167,7 +203,7 @@
       tmp.delete(); vec.delete(); hier.delete();
     }
     auto.invert = best.invert;
-    mask.delete(); mask = best.mask;
+    if (mask) try{mask.delete()}catch{}; mask = best.mask; // keep best
 
     // Dynamic area from quantiles
     const vec2=new cv.MatVector(), hier2=new cv.Mat();
@@ -188,37 +224,8 @@
     overlay.height = Math.round(h * dpr);
     const sx = overlay.width / w;
     const sy = overlay.height / h;
-    octx.setTransform(sx, 0, 0, sy, 0, 0); // draw in video pixel coords
-    // work/offscreen
+    octx.setTransform(sx, 0, 0, sy, 0, 0);
     work.width = w; work.height = h; initMats(w,h);
-  }
-
-  function classifyPill(cx, cy, r){
-    // Sample small ROI around center for color & simple shape hints
-    const size = Math.max(6, Math.round(r*0.8));
-    const x = Math.max(0, Math.round(cx - size));
-    const y = Math.max(0, Math.round(cy - size));
-    const w = Math.min(size*2, hsv.cols - x);
-    const h = Math.min(size*2, hsv.rows - y);
-    if (w<=0 || h<=0) return {color:'', shape:''};
-    const roi = hsv.roi(new cv.Rect(x,y,w,h));
-    const mean = cv.mean(roi); roi.delete();
-    const H = mean[0], S = mean[1], V = mean[2];
-    let color='';
-    if (S < 40 && V > 180) color='white';
-    else if (H<10 || H>170) color='red';
-    else if (H<25) color='orange';
-    else if (H<40) color='yellow';
-    else if (H<85) color='green';
-    else if (H<130) color='cyan';
-    else color='blue';
-    let shape='round';
-    // Approx shape by local aspect ratio from bounding box size
-    // (More robust fitEllipse may not be available in OpenCV.js build)
-    const bw = Math.max(1, Math.min(overlay.width, size*2));
-    const bh = Math.max(1, Math.min(overlay.height, size*2));
-    const ar = bw/bh; if (ar>1.6 || ar<0.62) shape='capsule/oval';
-    return {color, shape};
   }
 
   function processFrame(){
@@ -228,7 +235,7 @@
       if(!w||!h){ requestAnimationFrame(processFrame); return; }
       if (work.width !== w || work.height !== h) { scaleOverlayToVideo(); }
 
-      // Draw live frame to offscreen
+      // Read frame
       wctx.drawImage(video,0,0,w,h);
       if (src) { try { src.delete(); } catch {} }
       src = cv.imread(work);
@@ -236,31 +243,42 @@
       cv.cvtColor(rgba, hsv, cv.COLOR_RGB2HSV);
       cv.cvtColor(rgba, gray, cv.COLOR_RGB2GRAY);
 
-      // Brightness/contrast
-      const meanScalar = cv.mean(gray);
-      autoBrighten(meanScalar[0]);
-
+      // Illumination correction + contrast
+      const enhanced = enhanceIllumination();
       // Denoise
-      cv.GaussianBlur(gray, blur, new cv.Size(5,5), 1.1, 1.1);
+      cv.GaussianBlur(enhanced, blur, new cv.Size(5,5), 1.1, 1.1);
 
-      // Auto-calibrate periodically and during warm-up
+      // Build three masks: Otsu (auto polarity), Adaptive, and HSV light
       if (frameIndex < warmup || frameIndex % 30 === 0){
-        choosePolarityAndThreshold();
+        choosePolarityAndThreshold(blur);
       } else {
-        const type=(auto.invert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
-        cv.threshold(blur, mask, 0, 255, type);
-        cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel);
-        cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
+        const t=(auto.invert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
+        cv.threshold(blur, mask, 0, 255, t);
+        cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernelSmall);
+        cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernelSmall);
       }
+      const adaptive = new cv.Mat();
+      const block = odd(Math.round(Math.min(w,h)*0.07));
+      cv.adaptiveThreshold(blur, adaptive, 255, cv.ADAPTIVE_THRESH_MEAN_C, auto.invert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY, Math.max(3,block), 5);
+      const hsvMask = hsvLightMask();
 
-      // Edge assist & split touching pills
-      cv.Canny(blur, edges, 50, 130);
-      cv.distanceTransform(mask, dt, cv.DIST_L2, 3);
+      // Fuse masks: (Otsu ∧ Adaptive) ∨ HSV
+      const fuse1 = new cv.Mat(); cv.bitwise_and(mask, adaptive, fuse1);
+      const fused = new cv.Mat(); cv.bitwise_or(fuse1, hsvMask, fused);
+      // Clean
+      cv.morphologyEx(fused, fused, cv.MORPH_OPEN, kernelSmall);
+      cv.morphologyEx(fused, fused, cv.MORPH_CLOSE, kernelSmall);
+
+      // Split touching via distance transform watershed-lite
+      cv.distanceTransform(fused, dt, cv.DIST_L2, 3);
       const dtNorm = new cv.Mat(); cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
       const fg = new cv.Mat(); cv.threshold(dtNorm, fg, 0.35, 1.0, cv.THRESH_BINARY); fg.convertTo(fg, cv.CV_8U, 255);
-      const finalMask = new cv.Mat(); cv.bitwise_and(mask, fg, finalMask);
+      const finalMask = new cv.Mat(); cv.bitwise_and(fused, fg, finalMask);
 
-      // Contours
+      // Edges for quality scoring
+      cv.Canny(blur, edges, 50, 130);
+
+      // Contours → candidates with geometric checks (circularity, solidity, ellipse aspect)
       cv.findContours(finalMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
       let candidates=[];
       for(let i=0;i<contours.size();i++){
@@ -270,59 +288,65 @@
         const circ=(4*Math.PI*area)/(peri*peri+1e-6);
         const hull=new cv.Mat(); cv.convexHull(cnt,hull);
         const solid=area/Math.max(cv.contourArea(hull),1e-6);
-        // Edge density check to suppress flat blobs/shadows
+        let aspectScore=1.0;
+        try{
+          if (cnt.total && cnt.total()>=5){
+            const rr = cv.fitEllipse(cnt);
+            const a = Math.max(rr.size.width, rr.size.height);
+            const b = Math.min(rr.size.width, rr.size.height);
+            const ratio = b/(a+1e-6); // round→1, capsule→~0.4-0.8
+            aspectScore = Math.max(0, Math.min(1, ratio));
+          }
+        }catch{}
         const rect=cv.boundingRect(cnt);
         const eroi = edges.roi(rect); const nz = cv.countNonZero(eroi); eroi.delete();
         const edensity = nz / Math.max(1, rect.width*rect.height);
-        const pass = circ>=0.42 && solid>=0.78 && edensity>0.02 && edensity<0.35;
+        const pass = (circ>=0.38 && solid>=0.75 && edensity>0.015 && edensity<0.4);
         if(pass){
           const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
           const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
-          candidates.push({cx,cy,r,score:circ*solid});
+          const score = 0.5*circ + 0.3*solid + 0.2*aspectScore;
+          candidates.push({cx,cy,r,score});
         }
         hull.delete(); cnt.delete();
       }
 
-      // (Optional) Merge near-duplicates
+      // Non-maximum suppression (merge near-duplicates)
       candidates.sort((a,b)=>b.score-a.score);
       const dets=[]; const used=new Array(candidates.length).fill(false);
       for(let i=0;i<candidates.length;i++){
         if(used[i]) continue; const a=candidates[i]; dets.push(a); used[i]=true;
         for(let j=i+1;j<candidates.length;j++){
           if(used[j]) continue; const b=candidates[j];
-          const d=Math.hypot(a.cx-b.cx, a.cy-b.cy); if(d < Math.min(a.r,b.r)*0.6){ used[j]=true; }
+          const d=Math.hypot(a.cx-b.cx, a.cy-b.cy);
+          if(d < Math.min(a.r,b.r)*0.7){ used[j]=true; }
         }
       }
 
-      // Assign persistent IDs for stability
+      // Assign IDs and confirm across frames
       assignTracks(dets);
 
       // Draw overlay
       octx.clearRect(0,0,overlay.width, overlay.height);
-      octx.lineWidth = 3; octx.strokeStyle = 'rgba(0,255,0,0.95)';
-      octx.fillStyle = 'rgba(255,0,0,0.95)';
-      octx.font = '600 14px Poppins, Arial, sans-serif';
-      octx.textAlign='center'; octx.textBaseline='top';
-
-      let count = dets.length;
+      octx.lineWidth = 3;
+      let confirmed=0;
       for(const d of dets){
-        // Outline & dot
+        const isConfirmed = (d.age||1) >= 2;
+        if (isConfirmed) confirmed++;
+        // ring color by confirmation
+        octx.strokeStyle = isConfirmed ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
         octx.beginPath(); octx.arc(d.cx, d.cy, Math.max(6,d.r), 0, Math.PI*2); octx.stroke();
+        // center dot
+        octx.fillStyle = isConfirmed ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
         octx.beginPath(); octx.arc(d.cx, d.cy, 4, 0, Math.PI*2); octx.fill();
-        // Label (# + simple recognition)
-        const info = classifyPill(d.cx, d.cy, d.r);
-        const label = `#${d.id||'?'} ${info.shape} ${info.color}`.trim();
-        octx.fillStyle='rgba(0,0,0,0.55)'; octx.fillRect(d.cx-34, d.cy+d.r+6, 68, 18);
-        octx.fillStyle='white'; octx.fillText(label, d.cx, d.cy+d.r+6+2);
-        octx.fillStyle = 'rgba(255,0,0,0.95)';
       }
 
-      // Stable count via median of last 7 frames
-      recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
+      // Stable count via median over confirmed count
+      recentCounts.push(confirmed); if(recentCounts.length>7) recentCounts.shift();
       countEl.textContent = median(recentCounts);
 
       // Cleanup temps
-      dtNorm.delete(); fg.delete(); finalMask.delete();
+      enhanced.delete(); adaptive.delete(); hsvMask.delete(); fuse1.delete(); fused.delete(); dtNorm.delete(); fg.delete(); finalMask.delete();
 
       updateFps(); frameIndex++;
     } catch (e) {
@@ -333,7 +357,6 @@
 
   function setRunning(on){ running=on; if(on) requestAnimationFrame(processFrame); }
 
-  // Only enable Start after OpenCV is ready
   window.cv=window.cv||{};
   cv['onRuntimeInitialized']=()=>{ startBtn.disabled=false; console.log('OpenCV ready'); };
 
@@ -344,8 +367,7 @@
     if(ok){ scaleOverlayToVideo(); setRunning(true); } else { startBtn.disabled=false; }
   });
 
-  // Cleanup
-  window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,rgba,hsv,gray,blur,mask,morph,edges,kernel,contours,hierarchy,dt].forEach(m=>{try{m&&m.delete()}catch{}}); if(clahe){try{clahe.delete()}catch{}} });
+  window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,rgba,hsv,gray,blur,mask,edges,kernelSmall,kernelBig,contours,hierarchy,dt].forEach(m=>{try{m&&m.delete()}catch{}}); if(clahe){try{clahe.delete()}catch{}} });
 
   secureContextCheck();
 </script>
