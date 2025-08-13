@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Lexieye – Live Pill Counter (Real‑time, Robust)</title>
+  <title>Lexieye – Live Pill Counter (Calibrated)</title>
   <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
   <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet" />
   <style>
@@ -16,11 +16,12 @@
     .controls{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; margin-top:12px }
     .btn{ background:var(--primary); color:#fff; border:none; border-radius:20px; padding:10px 16px; cursor:pointer }
     .btn[disabled]{ opacity:.6; cursor:not-allowed }
-    .label{ font-size:.95rem }
-    .count{ font-weight:700 }
-    .err{ color:#b00020; font-size:.95rem }
     .pill{ display:inline-block; padding:2px 6px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff }
-    select, input[type="range"], input[type="number"]{ padding:6px 8px; border-radius:10px; border:1px solid #bcd6ef }
+    .err{ color:#b00020; font-size:.95rem }
+    .panel{ display:flex; flex-wrap:wrap; gap:14px; align-items:center }
+    label{ font-size:.92rem }
+    input[type="range"], input[type="number"], select{ padding:6px 8px; border-radius:10px; border:1px solid #bcd6ef }
+    .hint{ font-size:.9rem; opacity:.8 }
   </style>
 </head>
 <body>
@@ -30,304 +31,263 @@
     <div class="controls">
       <button id="startBtn" class="btn">Enable Camera</button>
       <button id="toggleBtn" class="btn" disabled>Start Live Count</button>
-      <span>Detected: <span id="count" class="count pill">0</span></span>
-      <span id="fps" title="frames per second" class="pill">0 fps</span>
+      <span class="pill">Detected: <b id="count">0</b></span>
+      <span class="pill" id="fps">0 fps</span>
     </div>
     <div class="err" id="err"></div>
 
     <div class="row">
       <video id="video" playsinline muted></video>
-      <canvas id="canvas"></canvas>
+      <canvas id="canvas" title="Tip: Tap a pill to auto‑calibrate color/size"></canvas>
     </div>
 
-    <div class="controls">
-      <span class="label">Mode</span>
-      <select id="mode">
-        <option value="contours">Contours (fast)</option>
-        <option value="hough">Hough Circles (round tablets)</option>
-        <option value="watershed">Watershed (split touching)</option>
-      </select>
-
-      <label class="label">Min size % of frame
-        <input type="number" id="minPct" value="0.02" step="0.005" min="0.001" max="0.2" style="width:80px"/>
+    <div class="panel" style="margin-top:12px">
+      <label>Mode
+        <select id="mode">
+          <option value="contours">Contours</option>
+          <option value="hough">Hough (round)</option>
+          <option value="watershed">Watershed (split)</option>
+        </select>
       </label>
-      <label class="label">Max size % of frame
-        <input type="number" id="maxPct" value="0.20" step="0.01" min="0.02" max="0.9" style="width:80px"/>
-      </label>
-
-      <label class="label">Invert
-        <input type="checkbox" id="invert" checked />
-      </label>
-      <label class="label">CLAHE (contrast)
-        <input type="checkbox" id="claheOn" checked />
-      </label>
-      <label class="label">Split touching
-        <input type="checkbox" id="splitOn" />
-      </label>
-      <label class="label">Show debug
+      <label>Use color mask <input type="checkbox" id="useColor" checked></label>
+      <label>HSV Hue <input type="range" id="hCenter" min="0" max="179" value="0"> ± <input type="range" id="hTol" min="0" max="30" value="10"></label>
+      <label>Sat ≤ <input type="range" id="sMax" min="0" max="255" value="60"></label>
+      <label>Val ≥ <input type="range" id="vMin" min="0" max="255" value="180"></label>
+      <label>Min size % <input type="number" id="minPct" value="0.01" step="0.005" min="0.001" max="0.2" style="width:80px"></label>
+      <label>Max size % <input type="number" id="maxPct" value="0.30" step="0.01" min="0.05" max="0.9" style="width:80px"></label>
+      <label>Invert BW <input type="checkbox" id="invert"></label>
+      <label>Debug
         <select id="debug">
           <option value="none">None</option>
+          <option value="mask">Color mask</option>
           <option value="thresh">Threshold</option>
           <option value="morph">Morph</option>
-          <option value="dt">Distance</option>
-          <option value="markers">Markers</option>
+          <option value="edges">Edges</option>
         </select>
       </label>
     </div>
+    <div class="hint">Tap on a pill in the preview to auto‑set HSV and size. Keep background plain, avoid reflections, and fill more of the frame with pills.</div>
   </div>
 
   <script>
-    // --- UI refs ---
-    const startBtn = document.getElementById('startBtn');
-    const toggleBtn = document.getElementById('toggleBtn');
-    const errEl = document.getElementById('err');
-    const video = document.getElementById('video');
-    const canvas = document.getElementById('canvas');
-    const ctx2d = canvas.getContext('2d');
-    const countEl = document.getElementById('count');
-    const fpsEl = document.getElementById('fps');
+    // UI
+    const startBtn=document.getElementById('startBtn');
+    const toggleBtn=document.getElementById('toggleBtn');
+    const errEl=document.getElementById('err');
+    const video=document.getElementById('video');
+    const canvas=document.getElementById('canvas');
+    const ctx2d=canvas.getContext('2d');
+    const countEl=document.getElementById('count');
+    const fpsEl=document.getElementById('fps');
 
-    const modeEl = document.getElementById('mode');
-    const minPctEl = document.getElementById('minPct');
-    const maxPctEl = document.getElementById('maxPct');
-    const invertEl = document.getElementById('invert');
-    const claheOnEl = document.getElementById('claheOn');
-    const splitOnEl = document.getElementById('splitOn');
-    const debugEl = document.getElementById('debug');
+    const modeEl=document.getElementById('mode');
+    const useColorEl=document.getElementById('useColor');
+    const hCenterEl=document.getElementById('hCenter');
+    const hTolEl=document.getElementById('hTol');
+    const sMaxEl=document.getElementById('sMax');
+    const vMinEl=document.getElementById('vMin');
+    const minPctEl=document.getElementById('minPct');
+    const maxPctEl=document.getElementById('maxPct');
+    const invertEl=document.getElementById('invert');
+    const debugEl=document.getElementById('debug');
 
+    // State
     let stream=null, running=false, lastTick=performance.now(), frames=0;
+    let recentCounts=[]; // for median debounce
 
-    // OpenCV mats
-    let src, rgba, gray, blur, thresh, morph, kernel, contours, hierarchy;
-    let clahe = null, dt = null, markers = null, three = null; // watershed helpers
+    // OpenCV Mats
+    let src, rgb, hsv, gray, blur, thresh, morph, kernel, contours, hierarchy, edges;
 
-    function showErr(msg){ errEl.textContent = msg; console.error(msg); }
+    function showErr(msg){ errEl.textContent=msg; console.error(msg); }
 
     function secureContextCheck(){
-      if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1'){
-        showErr('Camera requires HTTPS or localhost. Host over HTTPS or use a local dev server.');
+      if (location.protocol!=='https:' && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
+        showErr('Camera requires HTTPS or localhost.');
       }
     }
 
     async function startCamera(){
-      errEl.textContent = '';
-      const tries = [
-        { video: { facingMode: { ideal: 'environment' }, width:{ideal:1280}, height:{ideal:720} }, audio:false },
-        { video: true, audio: false }
+      errEl.textContent='';
+      const tries=[
+        {video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}, focusMode:'continuous'}, audio:false},
+        {video:true, audio:false}
       ];
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const back = devices.find(d => d.kind==='videoinput' && /back|environment/i.test(d.label||''));
-        if (back) tries.unshift({ video: { deviceId: { exact: back.deviceId } }, audio:false });
-      } catch {}
-
-      for (const c of tries){
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(c);
-          video.srcObject = stream; video.setAttribute('playsinline','true'); await video.play();
+      try{
+        const devs=await navigator.mediaDevices.enumerateDevices();
+        const back=devs.find(d=>d.kind==='videoinput' && /back|environment/i.test(d.label||''));
+        if(back) tries.unshift({video:{deviceId:{exact:back.deviceId}}, audio:false});
+      }catch{}
+      for(const c of tries){
+        try{
+          stream=await navigator.mediaDevices.getUserMedia(c);
+          video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play();
+          // Try to lock exposure if supported (quietly)
+          const track=stream.getVideoTracks()[0];
+          track.applyConstraints?.({advanced:[{exposureMode:'continuous', whiteBalanceMode:'continuous'}]}).catch(()=>{});
           return true;
-        } catch(e){
-          console.warn('gUM failure', c, e);
-          if (e.name==='NotAllowedError') showErr('Camera permission denied. Allow access and reload.');
-          if (e.name==='NotFoundError') showErr('No camera found.');
-        }
+        }catch(e){ console.warn('gUM fail',c,e); }
       }
       showErr('Could not start the camera.');
       return false;
     }
 
     function initMats(w,h){
-      // clean existing
-      [src, rgba, gray, blur, thresh, morph, kernel, contours, hierarchy, dt, markers, three].forEach(m=>{ try{ m&&m.delete(); }catch{} });
-      if (clahe){ try{ clahe.delete(); }catch{}; clahe=null; }
-
-      src = new cv.Mat(h, w, cv.CV_8UC4);
-      rgba= new cv.Mat(h, w, cv.CV_8UC3);
-      gray= new cv.Mat(h, w, cv.CV_8UC1);
-      blur= new cv.Mat(h, w, cv.CV_8UC1);
-      thresh=new cv.Mat(h, w, cv.CV_8UC1);
-      morph=new cv.Mat(h, w, cv.CV_8UC1);
+      [src,rgb,hsv,gray,blur,thresh,morph,kernel,contours,hierarchy,edges].forEach(m=>{try{m&&m.delete()}catch{}});
+      src=new cv.Mat(h,w,cv.CV_8UC4);
+      rgb=new cv.Mat(h,w,cv.CV_8UC3);
+      hsv=new cv.Mat(h,w,cv.CV_8UC3);
+      gray=new cv.Mat(h,w,cv.CV_8UC1);
+      blur=new cv.Mat(h,w,cv.CV_8UC1);
+      thresh=new cv.Mat(h,w,cv.CV_8UC1);
+      morph=new cv.Mat(h,w,cv.CV_8UC1);
+      edges=new cv.Mat(h,w,cv.CV_8UC1);
       kernel=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
       contours=new cv.MatVector();
       hierarchy=new cv.Mat();
-      dt = new cv.Mat();
-      markers = new cv.Mat();
-      three = new cv.Mat(h, w, cv.CV_8UC3);
-      try { clahe = cv.createCLAHE(2.0, new cv.Size(8,8)); } catch { clahe = null; }
     }
 
-    function percentToArea(px, py, pct){
-      // approximate as percentage of total pixels
-      const total = px*py; return Math.max(1, Math.round(total * pct));
-    }
+    function percentToArea(w,h,p){ return Math.max(1, Math.round(w*h*(p||0.02))); }
 
-    function updateFps(){
-      frames++;
-      const now = performance.now();
-      if (now - lastTick >= 1000){
-        fpsEl.textContent = `${frames} fps`;
-        frames = 0; lastTick = now;
+    function median(arr){ const a=[...arr].sort((x,y)=>x-y); const m=Math.floor(a.length/2); return a.length%2?a[m]:(a[m-1]+a[m])/2; }
+
+    function updateFps(){ frames++; const now=performance.now(); if(now-lastTick>=1000){ fpsEl.textContent=`${frames} fps`; frames=0; lastTick=now; } }
+
+    function buildMask(w,h){
+      // Color mask (HSV): default tuned for white/light pills; tap to calibrate adjusts sliders
+      if(!useColorEl.checked){
+        // grayscale threshold path
+        const type=(invertEl.checked?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
+        cv.threshold(blur, thresh, 0, 255, type);
+        cv.morphologyEx(thresh, morph, cv.MORPH_OPEN, kernel);
+        cv.morphologyEx(morph, morph, cv.MORPH_CLOSE, kernel);
+        return morph;
       }
+      const hC=+hCenterEl.value, hT=+hTolEl.value, sM=+sMaxEl.value, vM=+vMinEl.value;
+      const lower = new cv.Mat(h, w, cv.CV_8UC3, new cv.Scalar(Math.max(0,hC-hT), 0, vM));
+      const upper = new cv.Mat(h, w, cv.CV_8UC3, new cv.Scalar(Math.min(179,hC+hT), sM, 255));
+      const mask = new cv.Mat();
+      cv.inRange(hsv, lower, upper, mask);
+      // Clean up speckle
+      cv.morphologyEx(mask, morph, cv.MORPH_OPEN, kernel);
+      cv.morphologyEx(morph, morph, cv.MORPH_CLOSE, kernel);
+      lower.delete(); upper.delete(); mask.delete();
+      return morph;
     }
 
     function processFrame(){
-      if (!running) return;
-      const w = video.videoWidth||640, h = video.videoHeight||480;
-      if (!src || src.cols!==w || src.rows!==h){ canvas.width=w; canvas.height=h; initMats(w,h); }
+      if(!running) return;
+      const w=video.videoWidth||640, h=video.videoHeight||480;
+      if(!src || src.cols!==w || src.rows!==h){ canvas.width=w; canvas.height=h; initMats(w,h); }
 
-      ctx2d.drawImage(video, 0, 0, w, h);
+      ctx2d.drawImage(video,0,0,w,h);
       cv.imread(canvas, src);
-      cv.cvtColor(src, rgba, cv.COLOR_RGBA2RGB);
-      cv.cvtColor(rgba, gray, cv.COLOR_RGB2GRAY);
+      cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+      cv.cvtColor(rgb, hsv, cv.COLOR_RGB2HSV);
+      cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+      cv.GaussianBlur(gray, blur, new cv.Size(5,5), 1.2, 1.2);
 
-      // Contrast / illumination fix
-      if (claheOnEl.checked && clahe){ clahe.apply(gray, gray); }
+      const mask = buildMask(w,h);
 
-      // Smoothing
-      cv.medianBlur(gray, blur, 3);
-
-      // Threshold (Otsu). Invert if pills are bright on dark.
-      const flag = (invertEl.checked ? cv.THRESH_BINARY_INV : cv.THRESH_BINARY) + cv.THRESH_OTSU;
-      cv.threshold(blur, thresh, 0, 255, flag);
-
-      // Morph cleanup
-      cv.morphologyEx(thresh, morph, cv.MORPH_OPEN, kernel);
-      cv.morphologyEx(morph, morph, cv.MORPH_CLOSE, kernel);
-
-      const minArea = percentToArea(w,h, parseFloat(minPctEl.value)||0.02);
-      const maxArea = percentToArea(w,h, parseFloat(maxPctEl.value)||0.2);
-
-      let count = 0;
+      const minA = percentToArea(w,h, parseFloat(minPctEl.value));
+      const maxA = percentToArea(w,h, parseFloat(maxPctEl.value));
+      let count=0;
 
       const mode = modeEl.value;
-
-      if (mode === 'hough'){
-        // good for round tablets
+      if(mode==='hough'){
+        const tmp = new cv.Mat();
+        cv.bitwise_and(blur, blur, tmp, morph);
         const circles = new cv.Mat();
-        try {
-          cv.HoughCircles(blur, circles, cv.HOUGH_GRADIENT, 1, 20, 120, 25, 6, Math.floor(Math.min(w,h)*0.2));
-          for (let i=0; i<circles.cols; i++){
-            const x = circles.data32F[i*3], y = circles.data32F[i*3+1], r = circles.data32F[i*3+2];
-            const a = Math.PI*r*r;
-            if (a>=minArea && a<=maxArea){
-              cv.circle(rgba, new cv.Point(x,y), r, [0,255,0,255], 3);
-              count++;
-            }
+        try{
+          cv.HoughCircles(tmp, circles, cv.HOUGH_GRADIENT, 1, 20, 120, 25, 5, Math.floor(Math.min(w,h)*0.25));
+          for(let i=0;i<circles.cols;i++){
+            const x=circles.data32F[i*3], y=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
+            const a=Math.PI*r*r; if(a>=minA && a<=maxA){ cv.circle(rgb, new cv.Point(x,y), r, [0,255,0,255], 3); count++; }
           }
-        } finally { circles.delete(); }
-      }
-      else if (mode === 'watershed' || splitOnEl.checked){
-        // Split touching objects with watershed
-        // Distance transform for foreground
+        } finally{ circles.delete(); tmp.delete(); }
+      } else if(mode==='watershed'){
+        // Use distance transform to split touching components inside mask
+        const dt = new cv.Mat();
         cv.distanceTransform(morph, dt, cv.DIST_L2, 3);
-        // Normalize for visualization and thresholding
-        const dtNorm = new cv.Mat();
-        cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
-        const dt8 = new cv.Mat();
-        dtNorm.convertTo(dt8, cv.CV_8U, 255);
-
-        // Sure foreground
-        const dtThresh = new cv.Mat();
-        cv.threshold(dtNorm, dtThresh, 0.35, 1.0, cv.THRESH_BINARY);
-        dtThresh.convertTo(dt8, cv.CV_8U, 255);
-
-        // Sure background
-        const bg = new cv.Mat();
-        cv.dilate(morph, bg, kernel);
-
-        // Markers
-        const markers32 = new cv.Mat();
-        cv.subtract(bg, dt8, markers);
-        // Connected components on fg
-        const comps = new cv.Mat();
-        const nLabels = cv.connectedComponents(dt8, comps);
-        comps.convertTo(markers32, cv.CV_32S);
-
-        // Watershed needs 3‑channel input
-        cv.cvtColor(rgba, three, cv.COLOR_RGB2BGR);
-        cv.watershed(three, markers32);
-
-        // Count unique labels > 1 and draw contours
-        const labelMask = new cv.Mat(h, w, cv.CV_8U, new cv.Scalar(0));
-        // Iterate over labels; we draw boundaries from markers32
-        // Extract contours on morph (clean mask) and filter by area
-        cv.findContours(morph, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-        for (let i=0;i<contours.size();i++){
-          const cnt = contours.get(i);
-          const area = cv.contourArea(cnt);
-          if (area>=minArea && area<=maxArea){
-            const M = cv.moments(cnt);
-            const cx = M.m10/(M.m00||1), cy = M.m01/(M.m00||1);
-            const r = Math.max(4, Math.sqrt(area/Math.PI)|0);
-            cv.circle(rgba, new cv.Point(cx,cy), r, [0,255,0,255], 3);
-            count++;
+        const dtNorm = new cv.Mat(); cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
+        const fg = new cv.Mat(); cv.threshold(dtNorm, fg, 0.35, 1.0, cv.THRESH_BINARY);
+        fg.convertTo(fg, cv.CV_8U, 255);
+        cv.findContours(fg, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        for(let i=0;i<contours.size();i++){
+          const cnt=contours.get(i); const area=cv.contourArea(cnt);
+          if(area>=minA && area<=maxA){
+            const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
+            const r=Math.max(4, Math.sqrt(area/Math.PI)|0); cv.circle(rgb, new cv.Point(cx,cy), r, [0,255,0,255], 3); count++;
           }
           cnt.delete();
         }
-        // Cleanup
-        dtNorm.delete(); dt8.delete(); dtThresh.delete(); bg.delete(); comps.delete(); markers32.delete(); labelMask.delete();
-      }
-      else { // contours (fast)
-        cv.findContours(morph, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-        for (let i=0;i<contours.size();i++){
-          const cnt = contours.get(i);
-          const area = cv.contourArea(cnt);
-          if (area<minArea || area>maxArea){ cnt.delete(); continue; }
-          const peri = cv.arcLength(cnt, true);
-          const circ = (4*Math.PI*area)/(peri*peri + 1e-6);
-          // accept most convex-ish shapes (capsules)
-          const hull = new cv.Mat(); cv.convexHull(cnt, hull);
-          const solid = area / Math.max(cv.contourArea(hull),1e-6);
-          if (circ>=0.5 && solid>=0.8){
-            const M = cv.moments(cnt);
-            const cx = M.m10/(M.m00||1), cy = M.m01/(M.m00||1);
-            const r = Math.max(4, Math.sqrt(area/Math.PI)|0);
-            cv.circle(rgba, new cv.Point(cx,cy), r, [0,255,0,255], 3);
-            count++;
+        dt.delete(); dtNorm.delete(); fg.delete();
+      } else {
+        // Contours + convexity, also leverage Canny edges to reject background
+        cv.Canny(blur, edges, 60, 140);
+        // combine edges with mask to keep only masked edges
+        const maskedEdges = new cv.Mat();
+        cv.bitwise_and(edges, morph, maskedEdges);
+        cv.findContours(maskedEdges, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        for(let i=0;i<contours.size();i++){
+          const cnt=contours.get(i); const area=cv.contourArea(cnt);
+          if(area<minA || area>maxA){ cnt.delete(); continue; }
+          const peri=cv.arcLength(cnt,true); const circ=(4*Math.PI*area)/(peri*peri+1e-6);
+          const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
+          if(circ>=0.45 && solid>=0.8){
+            const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
+            const r=Math.max(4, Math.sqrt(area/Math.PI)|0); cv.circle(rgb, new cv.Point(cx,cy), r, [0,255,0,255], 3); count++;
           }
           hull.delete(); cnt.delete();
         }
+        maskedEdges.delete();
       }
 
-      // Debug views
-      switch (debugEl.value){
-        case 'thresh': cv.imshow(canvas, thresh); break;
-        case 'morph':  cv.imshow(canvas, morph);  break;
-        case 'dt':     if (!dt.empty()) cv.imshow(canvas, dt); else cv.imshow(canvas, rgba); break;
-        default:
-          cv.imshow(canvas, rgba); break;
+      // Debug output
+      switch(debugEl.value){
+        case 'mask': cv.imshow(canvas, morph); break;
+        case 'thresh': cv.imshow(canvas, thresh); break; // (from grayscale path)
+        case 'morph': cv.imshow(canvas, morph); break;
+        case 'edges': cv.imshow(canvas, edges); break;
+        default: cv.imshow(canvas, rgb); break;
       }
 
-      countEl.textContent = count;
+      // Debounce with median of last 7 frames to avoid flicker
+      recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
+      const stable = median(recentCounts);
+      countEl.textContent=stable;
+
       updateFps();
       requestAnimationFrame(processFrame);
     }
 
-    function setRunning(on){
-      running = on; toggleBtn.textContent = on ? 'Stop Live Count' : 'Start Live Count';
-      if (on) requestAnimationFrame(processFrame);
-    }
+    function setRunning(on){ running=on; toggleBtn.textContent=on?'Stop Live Count':'Start Live Count'; if(on) requestAnimationFrame(processFrame); }
 
-    // UI events
-    startBtn.addEventListener('click', async () => {
-      secureContextCheck();
-      const ok = await startCamera();
-      if (ok){ toggleBtn.disabled=false; startBtn.disabled=true; }
+    // Tap to calibrate color + size
+    canvas.addEventListener('click', (e)=>{
+      const rect=canvas.getBoundingClientRect();
+      const x=Math.floor((e.clientX-rect.left)/rect.width*canvas.width);
+      const y=Math.floor((e.clientY-rect.top)/rect.height*canvas.height);
+      // sample 9x9 region average HSV
+      const size=9; const x0=Math.max(0,x-size), y0=Math.max(0,y-size);
+      const roi=hsv.roi(new cv.Rect(x0,y0, Math.min(size*2+1, hsv.cols-x0), Math.min(size*2+1, hsv.rows-y0)));
+      const mean = cv.mean(roi); roi.delete();
+      const h=Math.round(mean[0]), s=Math.round(mean[1]), v=Math.round(mean[2]);
+      hCenterEl.value = h; hTolEl.value = 12; sMaxEl.value = Math.min(255, Math.max(40, s+30)); vMinEl.value = Math.max(80, v-30);
+      useColorEl.checked = true;
+      // estimate size by finding nearest contour around the point next frame; here we just widen minPct a bit
+      minPctEl.value = (parseFloat(minPctEl.value)||0.01);
     });
+
+    // Buttons
+    startBtn.addEventListener('click', async()=>{ secureContextCheck(); const ok=await startCamera(); if(ok){ toggleBtn.disabled=false; startBtn.disabled=true; }});
     toggleBtn.addEventListener('click', ()=> setRunning(!running));
 
-    // OpenCV ready gate
-    window.cv = window.cv || {};
-    cv['onRuntimeInitialized'] = () => { console.log('OpenCV ready'); };
+    // OpenCV ready
+    window.cv=window.cv||{}; cv['onRuntimeInitialized']=()=>{ console.log('OpenCV ready'); };
 
     // Cleanup
-    window.addEventListener('beforeunload', () => {
-      try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
-      [src, rgba, gray, blur, thresh, morph, kernel, contours, hierarchy, dt, markers, three].forEach(m=>{ try{ m&&m.delete(); }catch{} });
-      if (clahe){ try{ clahe.delete(); }catch{} }
-    });
+    window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,rgb,hsv,gray,blur,thresh,morph,kernel,contours,hierarchy,edges].forEach(m=>{try{m&&m.delete()}catch{}}); });
 
-    // initial https check
     secureContextCheck();
   </script>
 </body>
