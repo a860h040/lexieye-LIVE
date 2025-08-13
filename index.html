@@ -380,10 +380,6 @@
       window.addEventListener('resize', ()=>{ if (video.videoWidth) syncOverlayToVideo(); });
     } else { startBtn.disabled=false; }
   });
-    startBtn.disabled=true;
-    const ok=await startCamera();
-    if(ok){ scaleToVideoAndOverlay(); setRunning(true); } else { startBtn.disabled=false; }
-  });
 
   window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop())}catch{}; [src,rgba,hsv,gray,blur,mask,edges,kernelSmall,kernelBig,contours,hierarchy,dt].forEach(m=>{try{m&&m.delete()}catch{}}); if(clahe){try{clahe.delete()}catch{}} });
 
