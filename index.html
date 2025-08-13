@@ -170,7 +170,9 @@
       overlay.style.height = rect.height + 'px';
       overlay.width = Math.round(w * dpr);
       overlay.height = Math.round(h * dpr);
-      octx.setTransform(dpr,0,0,dpr,0,0); // draw in video pixel coords
+      const sx = overlay.width / w;
+      const sy = overlay.height / h;
+      octx.setTransform(sx, 0, 0, sy, 0, 0); // draw in video pixel coords
       // work/offscreen
       work.width = w; work.height = h;
       initMats(w,h);
@@ -178,76 +180,82 @@
 
     function processFrame(){
       if(!running) return;
-      const w=video.videoWidth||640, h=video.videoHeight||480;
-      if(!w||!h){ requestAnimationFrame(processFrame); return; }
-      if (work.width !== w || work.height !== h) { scaleOverlayToVideo(); }
+      try {
+        const w=video.videoWidth||640, h=video.videoHeight||480;
+        if(!w||!h){ requestAnimationFrame(processFrame); return; }
+        if (work.width !== w || work.height !== h) { scaleOverlayToVideo(); }
 
-      // Draw the live video frame into the OFFSCREEN work canvas
-      wctx.drawImage(video,0,0,w,h);
-      cv.imread(work, src);
-      cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        // Draw the live video frame into the OFFSCREEN work canvas
+        wctx.drawImage(video,0,0,w,h);
+        if (src) { try { src.delete(); } catch {} }
+        src = cv.imread(work);
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
-      // Auto brighten & contrast if dark
-      const meanScalar = cv.mean(gray);
-      autoBrighten(meanScalar[0]);
+        // Auto brighten & contrast if dark
+        const meanScalar = cv.mean(gray);
+        autoBrighten(meanScalar[0]);
 
-      // Denoise
-      cv.GaussianBlur(gray, blur, new cv.Size(5,5), 1.1, 1.1);
+        // Denoise
+        cv.GaussianBlur(gray, blur, new cv.Size(5,5), 1.1, 1.1);
 
-      // Auto-calibrate periodically and during warm-up
-      if (frameIndex < warmup || frameIndex % 30 === 0){
-        choosePolarityAndThreshold();
-      } else {
-        const type=(auto.invert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
-        cv.threshold(blur, mask, 0, 255, type);
-        cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel);
-        cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
-      }
-
-      // Optional splitting of touching pills using distance transform (lightweight)
-      cv.distanceTransform(mask, dt, cv.DIST_L2, 3);
-      const dtNorm = new cv.Mat();
-      cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
-      const fg = new cv.Mat();
-      cv.threshold(dtNorm, fg, 0.35, 1.0, cv.THRESH_BINARY);
-      fg.convertTo(fg, cv.CV_8U, 255);
-
-      // Final mask for contouring: intersect foreground with original mask to keep shapes
-      const finalMask = new cv.Mat();
-      cv.bitwise_and(mask, fg, finalMask);
-
-      // Find pills and collect their centers for overlay
-      cv.findContours(finalMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-      let count=0; const dots=[]; const rings=[];
-      for(let i=0;i<contours.size();i++){
-        const cnt=contours.get(i); const area=cv.contourArea(cnt);
-        if(area<auto.minAreaPx || area>auto.maxAreaPx){ cnt.delete(); continue; }
-        const peri=cv.arcLength(cnt,true);
-        const circ=(4*Math.PI*area)/(peri*peri+1e-6);
-        const hull=new cv.Mat(); cv.convexHull(cnt,hull);
-        const solid=area/Math.max(cv.contourArea(hull),1e-6);
-        if(circ>=0.42 && solid>=0.78){
-          const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
-          const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
-          dots.push({cx,cy}); rings.push({cx,cy,r}); count++;
+        // Auto-calibrate periodically and during warm-up
+        if (frameIndex < warmup || frameIndex % 30 === 0){
+          choosePolarityAndThreshold();
+        } else {
+          const type=(auto.invert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY)+cv.THRESH_OTSU;
+          cv.threshold(blur, mask, 0, 255, type);
+          cv.morphologyEx(mask, mask, cv.MORPH_OPEN, kernel);
+          cv.morphologyEx(mask, mask, cv.MORPH_CLOSE, kernel);
         }
-        hull.delete(); cnt.delete();
+
+        // Optional splitting of touching pills using distance transform (lightweight)
+        cv.distanceTransform(mask, dt, cv.DIST_L2, 3);
+        const dtNorm = new cv.Mat();
+        cv.normalize(dt, dtNorm, 0, 1.0, cv.NORM_MINMAX);
+        const fg = new cv.Mat();
+        cv.threshold(dtNorm, fg, 0.35, 1.0, cv.THRESH_BINARY);
+        fg.convertTo(fg, cv.CV_8U, 255);
+
+        // Final mask for contouring: intersect foreground with original mask to keep shapes
+        const finalMask = new cv.Mat();
+        cv.bitwise_and(mask, fg, finalMask);
+
+        // Find pills and collect their centers for overlay
+        cv.findContours(finalMask, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        let count=0; const dots=[]; const rings=[];
+        for(let i=0;i<contours.size();i++){
+          const cnt=contours.get(i); const area=cv.contourArea(cnt);
+          if(area<auto.minAreaPx || area>auto.maxAreaPx){ cnt.delete(); continue; }
+          const peri=cv.arcLength(cnt,true);
+          const circ=(4*Math.PI*area)/(peri*peri+1e-6);
+          const hull=new cv.Mat(); cv.convexHull(cnt,hull);
+          const solid=area/Math.max(cv.contourArea(hull),1e-6);
+          if(circ>=0.42 && solid>=0.78){
+            const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
+            const r=Math.max(4, Math.sqrt(area/Math.PI)|0);
+            dots.push({cx,cy}); rings.push({cx,cy,r}); count++;
+          }
+          hull.delete(); cnt.delete();
+        }
+
+        // Draw overlay (transparent) on top of the live video
+        octx.clearRect(0,0,overlay.width, overlay.height);
+        octx.lineWidth = 3; octx.strokeStyle = 'rgba(0,255,0,0.95)';
+        for(const {cx,cy,r} of rings){ octx.beginPath(); octx.arc(cx, cy, r, 0, Math.PI*2); octx.stroke(); }
+        // Center DOT on each pill
+        octx.fillStyle = 'rgba(255,0,0,0.95)';
+        for(const {cx,cy} of dots){ octx.beginPath(); octx.arc(cx, cy, 4, 0, Math.PI*2); octx.fill(); }
+
+        // Stable count via median of last 7 frames
+        recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
+        countEl.textContent = median(recentCounts);
+
+        updateFps(); frameIndex++;
+        dtNorm.delete(); fg.delete(); finalMask.delete();
+      } catch (e) {
+        console.error(e);
+        showErr(e?.message || String(e));
       }
-
-      // Draw overlay (transparent) on top of the live video
-      octx.clearRect(0,0,overlay.width, overlay.height);
-      octx.lineWidth = 3; octx.strokeStyle = 'rgba(0,255,0,0.95)';
-      for(const {cx,cy,r} of rings){ octx.beginPath(); octx.arc(cx, cy, r, 0, Math.PI*2); octx.stroke(); }
-      // Center DOT on each pill
-      octx.fillStyle = 'rgba(255,0,0,0.95)';
-      for(const {cx,cy} of dots){ octx.beginPath(); octx.arc(cx, cy, 4, 0, Math.PI*2); octx.fill(); }
-
-      // Stable count via median of last 7 frames
-      recentCounts.push(count); if(recentCounts.length>7) recentCounts.shift();
-      countEl.textContent = median(recentCounts);
-
-      updateFps(); frameIndex++;
-      dtNorm.delete(); fg.delete(); finalMask.delete();
       requestAnimationFrame(processFrame);
     }
 
