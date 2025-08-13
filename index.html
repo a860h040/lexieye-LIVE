@@ -38,12 +38,9 @@
   </div>
 
 <script>
-// ==== LIVE PILL COUNTER — ROUND + CAPSULES — HIGH RECALL (21‑pill scene fix) ====
-// Fixes from your last screenshot:
-//  • Kill HUGE false ellipse on the right via a size prior + hard max size.
-//  • Split clusters better (lower DT threshold).
-//  • Count shows Confirmed / Total.
-//  • Faster (≤360px proc width) to stabilize detections.
+// ==== LIVE PILL COUNTER — ROUND + CAPSULES — Lock confirmed pills for 20s ====
+// New: once a detection is confirmed (green), we freeze its position/size for 20s.
+// It stays green and does not wiggle; after 20s it can move again.
 
 const startBtn=document.getElementById('startBtn');
 const errEl=document.getElementById('err');
@@ -62,6 +59,9 @@ let procW=0, procH=0, vidW=0, vidH=0, sX=1, sY=1;
 
 // Size prior (auto‑learned)
 const sizePrior = { R:null }; // estimated typical radius in VIDEO pixels
+
+// === Lock parameters ===
+const LOCK_MS = 20000; // 20 seconds
 
 // Offscreen buffer
 const work=document.createElement('canvas');
@@ -145,21 +145,51 @@ function hsvBrightMask(){
   vMask.delete(); sMask.delete(); S.delete(); V.delete(); chs.delete();
 }
 
-// 2‑frame confirmation tracker (for drawing colors)
+// === Tracker with 20s lock ===
 const tracker={tracks:[], nextId:1};
 function assignTracks(dets){
-  const maxDist=Math.min(vidW,vidH)*0.06; // in video pixels
   const now=performance.now();
-  for(const t of tracker.tracks){ t.matched=false; }
-  for(const d of dets){
-    let best=null,bd=1e9; for(const t of tracker.tracks){ const dd=Math.hypot(d.x - t.x, d.y - t.y); if(dd<bd && dd<maxDist){ best=t; bd=dd; } }
-    if(best){ best.x=0.7*best.x+0.3*d.x; best.y=0.7*best.y+0.3*d.y; best.r1=0.7*(best.r1||d.r1)+0.3*d.r1; best.r2=0.7*(best.r2||d.r2)+0.3*d.r2; best.a = d.a; best.seen=now; best.matched=true; best.age=(best.age||0)+1; d.age=best.age; }
-    else { tracker.tracks.push({x:d.x,y:d.y,r1:d.r1,r2:d.r2,a:d.a,seen:now,matched:true,age:1}); d.age=1; }
-  }
-  tracker.tracks = tracker.tracks.filter(t=>now-t.seen<1000);
-}
+  const maxDist=Math.min(vidW,vidH)*0.06; // in video px
 
-function q(arr,p){ const a=[...arr].sort((x,y)=>x-y); const i=Math.max(0,Math.min(a.length-1, Math.round((a.length-1)*p))); return a[i]; }
+  // reset matched flags
+  for(const t of tracker.tracks){ t.matched=false; }
+
+  // greedy assignment
+  for(const d of dets){
+    let best=null,bd=1e9;
+    for(const t of tracker.tracks){
+      const dd=Math.hypot(d.x - t.x, d.y - t.y);
+      if(dd<bd && dd<maxDist){ best=t; bd=dd; }
+    }
+    if(best){
+      // If locked, keep its pose frozen; only refresh timestamps/age
+      const locked = best.lockedUntil && now < best.lockedUntil;
+      if(!locked){
+        best.x=0.7*best.x+0.3*d.x; best.y=0.7*best.y+0.3*d.y;
+        best.r1=0.7*(best.r1||d.r1)+0.3*d.r1; best.r2=0.7*(best.r2||d.r2)+0.3*d.r2; best.a=d.a;
+      }
+      best.seen=now; best.matched=true; best.age=(best.age||0)+1;
+      // propagate frozen pose to the detection so drawing doesn't jitter
+      d.x=best.x; d.y=best.y; d.r1=best.r1; d.r2=best.r2; d.a=best.a; d.id=best.id; d.age=best.age; d.locked=locked;
+    }else{
+      // new track
+      const nt={ id:tracker.nextId++, x:d.x, y:d.y, r1:d.r1, r2:d.r2, a:d.a, seen:now, matched:true, age:1, firstConfirmedAt:null, lockedUntil:null };
+      tracker.tracks.push(nt);
+      d.id=nt.id; d.age=1; d.locked=false;
+    }
+  }
+
+  // promote to locked once confirmed; keep locked tracks alive longer
+  for(const t of tracker.tracks){
+    if(!t.firstConfirmedAt && (t.age||0) >= 2){ t.firstConfirmedAt=now; t.lockedUntil = now + LOCK_MS; }
+  }
+
+  // Expire tracks (longer TTL when locked)
+  tracker.tracks = tracker.tracks.filter(t=>{
+    const ttl = (t.lockedUntil && now < t.lockedUntil) ? (LOCK_MS + 3000) : 1200;
+    return (now - t.seen) < ttl;
+  });
+}
 
 function process(){
   if(!running) return;
@@ -260,10 +290,16 @@ function process(){
 
     assignTracks(merged);
 
-    // Draw (green=confirmed ≥2 frames, orange=tentative)
-    octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; let confirmed=0;
+    // Draw (green=confirmed ≥2 frames, orange=tentative). Also draw locked tracks even if not detected this frame.
+    octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3;
+    let confirmed=0; let total = merged.length; const drawnIds=new Set(); const now=performance.now();
+
     for(const d of merged){
-      const ok=(d.age||1)>=2; if(ok) confirmed++;
+      const t = tracker.tracks.find(t=>t.id===d.id);
+      const locked = t && t.lockedUntil && now < t.lockedUntil;
+      const ok = (d.age||1)>=2 || locked; // locked stays green
+      if(ok) confirmed++;
+      drawnIds.add(d.id);
       octx.strokeStyle = ok ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
       octx.fillStyle   = ok ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
       if(d.type==='ellipse'){
@@ -274,9 +310,24 @@ function process(){
       octx.beginPath(); octx.arc(d.x,d.y,4,0,Math.PI*2); octx.fill();
     }
 
+    // Add locked-but-unmatched tracks to drawing & counts, still green and frozen
+    for(const t of tracker.tracks){
+      const locked = t.lockedUntil && now < t.lockedUntil;
+      if(locked && !drawnIds.has(t.id)){
+        confirmed++; total++; drawnIds.add(t.id);
+        octx.strokeStyle='rgba(0,200,0,0.98)'; octx.fillStyle='rgba(255,0,0,0.98)';
+        if((t.r2||t.r1) && Math.abs((t.r1||0)-(t.r2||0))>1){
+          octx.beginPath(); octx.ellipse(t.x,t.y,Math.max(6,t.r1||8),Math.max(6,t.r2||8),t.a||0,0,Math.PI*2); octx.stroke();
+        }else{
+          octx.beginPath(); octx.arc(t.x,t.y,Math.max(6,t.r1||8),0,Math.PI*2); octx.stroke();
+        }
+        octx.beginPath(); octx.arc(t.x,t.y,4,0,Math.PI*2); octx.fill();
+      }
+    }
+
     // Show Confirmed / Total
-    const total = merged.length; const conf = confirmed; recentCounts.push(total); if(recentCounts.length>7) recentCounts.shift();
-    countEl.textContent = `Confirmed: ${conf} / Total: ${median(recentCounts)}`;
+    recentCounts.push(total); if(recentCounts.length>7) recentCounts.shift();
+    countEl.textContent = `Confirmed: ${confirmed} / Total: ${median(recentCounts)}`;
 
     finalMask.delete();
     updateFps();
@@ -295,3 +346,4 @@ window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().for
 </script>
 </body>
 </html>
+
