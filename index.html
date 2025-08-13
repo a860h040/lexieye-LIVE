@@ -15,6 +15,7 @@
     .btn{ background:var(--primary); color:#fff; border:none; border-radius:16px; padding:10px 14px; cursor:pointer }
     .btn[disabled]{ opacity:.6; cursor:not-allowed }
     .pill{ display:inline-block; padding:4px 10px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff; font-size:1.4rem; font-weight:800; letter-spacing:.02em }
+    #count{ font-size:clamp(3rem,12vw,10rem); font-weight:900; line-height:1; font-variant-numeric:tabular-nums; letter-spacing:.02em }
     .err{ color:#b00020; font-size:.95rem; min-height:1.2em }
 
     .feed{ position:relative; width:100%; max-width:960px; margin-top:10px }
@@ -27,7 +28,7 @@
   <h1>💊 Lexieye — Live Pill Counter</h1>
   <div class="wrap">
     <div class="controls">
-      <button id="startBtn" class="btn">Enable Camera & Start</button>
+      $1 <button id="recountBtn" class="btn">Recount Final</button>
       <span class="pill"><span id="count">…</span></span>
       <span class="pill" id="fps">0 fps</span>
     </div>
@@ -49,7 +50,8 @@ const video    = document.getElementById('video');
 const overlay  = document.getElementById('overlay');
 const octx     = overlay.getContext('2d');
 const countEl  = document.getElementById('count');
-const fpsEl    = document.getElementById('fps');
+const fpsEl = document.getElementById('fps');
+const recountBtn = document.getElementById('recountBtn');
 
 let stream=null, running=false, lastTick=performance.now(), frames=0, frameIdx=0;
 let vidW=0, vidH=0, procW=0, procH=0, sX=1, sY=1;
@@ -309,7 +311,24 @@ function process(){
 }
 
 window.cv=window.cv||{}; cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
-startBtn.addEventListener('click', async()=>{ startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); }); } else { startBtn.disabled=false; }});
+$1
+
+recountBtn.addEventListener('click', ()=>{
+  const now = performance.now();
+  const total = tracker.tracks.length;
+  const locked = tracker.tracks.filter(t => t.lockedUntil && now < t.lockedUntil).length;
+  if (total > 0 && locked === total) {
+    // force a fresh final now and freeze it for 10s
+    countLock.value = locked;
+    nextCountAt = now + COUNT_FREEZE_MS;
+    countEl.textContent = `${locked}`;
+  } else {
+    // not all locked — clear display and wait until all lock
+    countLock.value = null;
+    nextCountAt = 0;
+    countEl.textContent = '…';
+  }
+}); if(ok){ const ready=()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); }); } else { startBtn.disabled=false; }});
 
 window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin,prevBlur].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
