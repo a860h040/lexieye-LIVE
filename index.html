@@ -40,12 +40,12 @@
   </div>
 
 <script>
-// ==== LIVE PILL COUNTER — ultra performance (target ≈4× faster) ====
-// Speed strategies:
-//  • Lower proc resolution to 200px width.
-//  • Run heavy detection only on demand (DETECT_EVERY frames or if scene changed).
-//  • Throttle CLAHE / gradients / DT / Hough harder.
-//  • Keep tracker + 10s hard‑lock + halo + count‑freeze logic intact.
+// ==== LIVE PILL COUNTER — performance boost (≈2x faster) ====
+// Changes for speed:
+//  • Smaller proc resolution (width 280) with smart scaling.
+//  • Cache heavy steps and run them every 2 frames: CLAHE, gradients, distance‑transform, Hough.
+//  • Early edge check (fast) + full ring check only when needed (already present).
+//  • Counting/drawing still uses tracker w/ 10s hard‑lock + halo.
 
 const startBtn=document.getElementById('startBtn');
 const errEl=document.getElementById('err');
@@ -56,36 +56,29 @@ const countEl=document.getElementById('count');
 const fpsEl=document.getElementById('fps');
 
 let stream=null, running=false, lastTick=performance.now(), frames=0;
-let recentTotals=[]; let frameIdx=0;
+let recentTotals=[]; // smoothing for total only
+let frameIdx=0;      // frame counter for throttled ops
 
-// === Processing resolution ===
-const PROC_MAX_W = 320; // ↓ from 280/360 — bigger speedup
+// Process size for speed
+const PROC_MAX_W = 280; // ↓ from 360 — big speedup with minimal accuracy loss
 let procW=0, procH=0, vidW=0, vidH=0, sX=1, sY=1;
 
-// === Perf throttles ===
-const PERF={ DT_EVERY:2, GRAD_EVERY:2, HOUGH_EVERY:3, CLAHE_EVERY:2 };
-const DETECT_EVERY = 2;         // try full detect every N frames
-const CHANGE_THR   = 4;         // mean abs‑diff threshold (0..255) to trigger detect         // mean abs‑diff threshold (0..255) to trigger detect
+// Perf throttles
+const PERF={ DT_EVERY:2, GRAD_EVERY:2, HOUGH_EVERY:2, CLAHE_EVERY:2 };
 
-// === Size prior ===
-const sizePrior = { R:null };
+// Size prior (auto‑learned)
+const sizePrior = { R:null }; // estimated typical radius in VIDEO pixels
 
-// === Locks ===
+// === Lock parameters ===
 const LOCK_MS = 10000; // 10 seconds
-const LOCK_HALO_SCALE = 1.25;
-const LOCK_HALO_PAD   = 8;
+const LOCK_HALO_SCALE = 1.25; // halo radius = max(r1,r2)*scale + pad
+const LOCK_HALO_PAD   = 8;    // extra pixels
 
-// === Final count freeze ===
-const COUNT_FREEZE_MS = 10000; // 10s
-let countLock = { value: null };
-let nextCountAt = 0;       // next scheduled time we may update the final count
-let inAllLocked = false;   // whether we are currently in an "all green & locked" phase
-
-// === Edge‑ring ===
-const EDGE_RING_MIN_PX = 2;
-const EDGE_RING_THICK_SCALE = 0.22;
-const EDGE_MIN_COVER   = 0.30;
-const EDGE_BIN_BIAS    = 8;
+// === Edge‑ring validation params ===
+const EDGE_RING_MIN_PX = 2;         // minimum ring thickness in processing pixels
+const EDGE_RING_THICK_SCALE = 0.22; // thickness = scale * radius (clamped by min above)
+const EDGE_MIN_COVER   = 0.33;      // fraction of rim pixels that must be strong edge
+const EDGE_BIN_BIAS    = 8;         // threshold = meanGrad + bias
 
 // Offscreen buffer
 const work=document.createElement('canvas');
@@ -94,10 +87,9 @@ const wctx=work.getContext('2d');
 // OpenCV mats (proc size)
 let src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt;
 let contours,hierarchy,kSmall,kBig,clahe;
-let sobelX,sobelY,absX,absY,grad,gradBin; // edge ring
-let prevBlur; // scene change
+let sobelX,sobelY,absX,absY,grad,gradBin; // for edge ring test
 
-// caches
+// Caches to avoid recomputing every frame
 const cache={ grad:null, gradBin:null, dtMask:null };
 
 function showErr(m){ errEl.textContent=m||''; console.error(m); }
@@ -135,7 +127,7 @@ function syncOverlayAndBuffers(){
   work.width = procW; work.height = procH;
   sX = vidW / procW; sY = vidH / procH;
 
-  [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin,prevBlur].forEach(m=>{try{m&&m.delete()}catch{}});
+  [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}});
   src=new cv.Mat(procH,procW,cv.CV_8UC4);
   rgb=new cv.Mat(procH,procW,cv.CV_8UC3);
   hsv=new cv.Mat(procH,procW,cv.CV_8UC3);
@@ -148,8 +140,8 @@ function syncOverlayAndBuffers(){
   dt=new cv.Mat(procH,procW,cv.CV_32F);
   contours=new cv.MatVector();
   hierarchy=new cv.Mat();
-  const ks=odd(Math.max(3, Math.round(Math.min(procW,procH)*0.018))); // slightly smaller
-  const kb=odd(Math.max(7, Math.round(Math.min(procW,procH)*0.06)));   // slightly smaller
+  const ks=odd(Math.max(3, Math.round(Math.min(procW,procH)*0.02)));
+  const kb=odd(Math.max(9, Math.round(Math.min(procW,procH)*0.07)));
   kSmall=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(ks,ks));
   kBig  =cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(kb,kb));
   try{ clahe=cv.createCLAHE(2.0, new cv.Size(8,8)); }catch{}
@@ -160,8 +152,8 @@ function updateFps(){ frames++; const now=performance.now(); if(now-lastTick>=10
 function hsvBrightMask(){
   const chs=new cv.MatVector(); cv.split(hsv,chs); const S=chs.get(1), V=chs.get(2);
   const meanV=cv.mean(V)[0];
-  const vMin=Math.max(80, Math.round(meanV+2));
-  const sMax=150;
+  const vMin=Math.max(86, Math.round(meanV+4));
+  const sMax=130;
   const vMask=new cv.Mat(), sMask=new cv.Mat();
   cv.threshold(V,vMask,vMin,255,cv.THRESH_BINARY);
   cv.threshold(S,sMask,sMax,255,cv.THRESH_BINARY_INV);
@@ -170,6 +162,7 @@ function hsvBrightMask(){
   vMask.delete(); sMask.delete(); S.delete(); V.delete(); chs.delete();
 }
 
+// === Edge‑ring test helpers (PROC space) ===
 function buildGradients(){
   if((frameIdx % PERF.GRAD_EVERY)===0 || !cache.grad){
     sobelX=new cv.Mat(); sobelY=new cv.Mat(); absX=new cv.Mat(); absY=new cv.Mat(); grad=new cv.Mat(); gradBin=new cv.Mat();
@@ -179,6 +172,7 @@ function buildGradients(){
     cv.addWeighted(absX, 0.5, absY, 0.5, 0, grad);
     const gMean=cv.mean(grad)[0];
     cv.threshold(grad, gradBin, Math.max(20, gMean + EDGE_BIN_BIAS), 255, cv.THRESH_BINARY);
+    // update cache
     cache.grad && cache.grad.delete(); cache.gradBin && cache.gradBin.delete();
     cache.grad = grad.clone(); cache.gradBin = gradBin.clone();
   } else {
@@ -216,7 +210,7 @@ function insideAnyZone(x,y,zs){ for(const z of zs){ if(Math.hypot(x-z.x,y-z.y) <
 
 function assignTracks(dets){
   const now=performance.now();
-  const maxDist=Math.min(vidW,vidH)*0.06;
+  const maxDist=Math.min(vidW,vidH)*0.06; // in video px
   const zones=lockedZones(now);
 
   for(const t of tracker.tracks){ t.matched=false; }
@@ -225,7 +219,7 @@ function assignTracks(dets){
     let best=null,bd=1e9;
     for(const t of tracker.tracks){
       const locked = t.lockedUntil && now < t.lockedUntil;
-      if(locked) continue;
+      if(locked) continue; // skip locked in matching
       const dd=Math.hypot(d.x - t.x, d.y - t.y);
       if(dd<bd && dd<maxDist){ best=t; bd=dd; }
     }
@@ -253,150 +247,143 @@ function process(){
     if(!video.videoWidth){ requestAnimationFrame(process); return; }
     if(overlay.width!==video.videoWidth || overlay.height!==video.videoHeight || work.width===0){ syncOverlayAndBuffers(); }
 
-    // Read frame → downscaled
+    // Read frame (downscaled for speed)
     wctx.drawImage(video,0,0,procW,procH);
     if(src){ try{ src.delete(); }catch{} }
     src=cv.imread(work);
-    cv.cvtColor(src,gray,cv.COLOR_RGBA2GRAY);
+    cv.cvtColor(src,rgb,cv.COLOR_RGBA2RGB);
+    cv.cvtColor(rgb,hsv,cv.COLOR_RGB2HSV);
+    cv.cvtColor(rgb,gray,cv.COLOR_RGB2GRAY);
 
-    // Illumination correction (lighter) + blur (smaller kernel)
+    // Illumination correction + blur
     const opened=new cv.Mat(), closed=new cv.Mat(), tophat=new cv.Mat(), blackhat=new cv.Mat(), enh=new cv.Mat();
     cv.morphologyEx(gray,opened,cv.MORPH_OPEN,kBig); cv.morphologyEx(gray,closed,cv.MORPH_CLOSE,kBig);
     cv.subtract(gray,opened,tophat); cv.subtract(closed,gray,blackhat); cv.add(gray,tophat,enh); cv.subtract(enh,blackhat,enh);
+    // Apply CLAHE less often
     if(clahe && (frameIdx % PERF.CLAHE_EVERY)===0){ try{ clahe.apply(enh,enh); }catch{} }
-    cv.GaussianBlur(enh,blur,new cv.Size(3,3),0.9,0.9);
+    cv.GaussianBlur(enh,blur,new cv.Size(5,5),1.05,1.05);
     opened.delete(); closed.delete(); tophat.delete(); blackhat.delete(); enh.delete();
 
-    // === Scene change detection ===
-    let sceneChanged=true;
-    if(prevBlur && !prevBlur.isDeleted()){ const diff=new cv.Mat(); cv.absdiff(blur,prevBlur,diff); const md=cv.mean(diff)[0]; sceneChanged = md > CHANGE_THR; diff.delete(); }
+    // Build gradients for edge‑ring test (cached every other frame)
+    buildGradients();
 
-    // Decide whether to run heavy detection this frame
-    const doDetect = (frameIdx % DETECT_EVERY)===0 || sceneChanged || tracker.tracks.length===0;
+    // Masks & fusion: (Otsu ∧ Adaptive) ∨ HSV
+    cv.threshold(blur,mask,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU);
+    const block = odd(Math.max(9, Math.round(Math.min(procW,procH)*0.09)));
+    cv.adaptiveThreshold(blur,adaptive,255,cv.ADAPTIVE_THRESH_MEAN_C,cv.THRESH_BINARY,block,5);
+    hsvBrightMask();
+    const both = new cv.Mat(); cv.bitwise_and(mask,adaptive,both);
+    cv.bitwise_or(both,hsvMask,fused); both.delete();
+    cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
 
-    if(doDetect){
-      // Build gradients for ring test
-      buildGradients();
-      // HSV only when detecting
-      cv.cvtColor(src,rgb,cv.COLOR_RGBA2RGB); cv.cvtColor(rgb,hsv,cv.COLOR_RGB2HSV);
-
-      // Masks & fusion: (Otsu ∧ Adaptive) ∨ HSV
-      cv.threshold(blur,mask,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU);
-      const block = odd(Math.max(9, Math.round(Math.min(procW,procH)*0.09)));
-      cv.adaptiveThreshold(blur,adaptive,255,cv.ADAPTIVE_THRESH_MEAN_C,cv.THRESH_BINARY,block,5);
-      hsvBrightMask();
-      const both = new cv.Mat(); cv.bitwise_and(mask,adaptive,both);
-      cv.bitwise_or(both,hsvMask,fused); both.delete();
-      cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
-
-      // Split touching pills (throttled DT)
-      let finalMask;
-      if((frameIdx % PERF.DT_EVERY)===0 || !cache.dtMask){
-        cv.distanceTransform(fused,dt,cv.DIST_L2,3);
-        const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
-        const kMax = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
-        const maxMap = new cv.Mat(); cv.dilate(dtn,maxMap,kMax);
-        const localMax = new cv.Mat(); cv.compare(dtn, maxMap, localMax, cv.CMP_EQ);
-        localMax.convertTo(localMax, cv.CV_8U, 255);
-        cv.bitwise_and(localMax, fused, localMax);
-        const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.22,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
-        cv.bitwise_or(fg, localMax, fg);
-        cv.morphologyEx(fg, fg, cv.MORPH_ERODE, kSmall);
-        finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
-        cache.dtMask && cache.dtMask.delete(); cache.dtMask = finalMask.clone();
-        dtn.delete(); fg.delete(); localMax.delete(); maxMap.delete();
-      }else{
-        finalMask = cache.dtMask.clone();
-      }
-
-      // Contours
-      contours.delete(); contours=new cv.MatVector(); hierarchy.delete(); hierarchy=new cv.Mat();
-      cv.findContours(finalMask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
-
-      const gMean = cv.mean(gray)[0];
-      const dets=[]; const eqRads=[];
-      for(let i=0;i<contours.size();i++){
-        const cnt=contours.get(i);
-        const area=cv.contourArea(cnt); if(area<55){ cnt.delete(); continue; }
-        const peri=cv.arcLength(cnt,true);
-        const circ=(4*Math.PI*area)/(peri*peri+1e-6);
-        const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
-        const rect=cv.boundingRect(cnt); const roi=finalMask.roi(rect); const cov=cv.countNonZero(roi)/(rect.width*rect.height); roi.delete();
-
-        const r2=gray.roi(rect); const m=new cv.Mat(); const s=new cv.Mat(); cv.meanStdDev(r2,m,s); const meanG=m.doubleAt(0,0); const stdG=s.doubleAt(0,0); r2.delete(); m.delete(); s.delete();
-
-        let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0; try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
-        const aspect = isEllipse ? Math.min(er1,er2)/Math.max(er1,er2) : 1;
-
-        const roundOK   = (circ>=0.66 && solid>=0.86 && aspect>=0.78);
-        const capsuleOK = (solid>=0.88 && aspect>=0.35 && aspect<0.78);
-        const brightOK  = (meanG > gMean + 3 && stdG < 50);
-        const coverOK   = cov > 0.22;
-
-        let strong=false; let edgeOK=true;
-        if(roundOK){
-          const M=cv.moments(cnt); const cx_p=M.m10/(M.m00||1), cy_p=M.m01/(M.m00||1); const r_p=Math.max(6, Math.sqrt(area/Math.PI));
-          buildGradients(); // ensure grad available when needed
-          edgeOK = ringEdgeOK(cx_p, cy_p, r_p);
-          strong = edgeOK && brightOK && solid>0.9 && circ>0.72;
-        }
-
-        if(brightOK && coverOK && ( (roundOK && edgeOK) || capsuleOK)){
-          if(roundOK){
-            const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6, Math.sqrt(area/Math.PI)); const Rv=r*Math.sqrt((sX+sY)/2);
-            dets.push({type:'circle', x:cx*sX, y:cy*sY, r1:Rv, r2:Rv, a:0, score:circ*solid, strong}); eqRads.push(Rv);
-          }else{
-            const Rv=Math.max(er1*sX, er2*sY); dets.push({type:'ellipse', x:ex*sX, y:ey*sY, r1:er1*sX, r2:er2*sY, a:eang, score:solid, strong:false}); eqRads.push(Rv);
-          }
-        }
-        hull.delete(); cnt.delete();
-      }
-
-      // Hough — throttled
-      if((frameIdx % PERF.HOUGH_EVERY)===0){
-        const tmp=new cv.Mat(); const circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
-        try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(6, Math.min(procW,procH)*0.05), 180, 40, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
-        for(let i=0;i<circles.cols;i++){
-          const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
-          if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
-          const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy)));
-          if(fused.ucharPtr(py,px)[0]===0) continue;
-          buildGradients(); const edgeOK = ringEdgeOK(cx, cy, r); if(!edgeOK) continue;
-          const Rv=r*Math.sqrt((sX+sY)/2);
-          dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95, strong:true}); eqRads.push(Rv);
-        }
-        tmp.delete(); circles.delete();
-      }
-
-      // Size prior & NMS
-      if(eqRads.length>=3){ const mid = median(eqRads.filter(v=>isFinite(v))); sizePrior.R = sizePrior.R? (0.7*sizePrior.R+0.3*mid) : mid; }
-      const R = sizePrior.R || median(eqRads.length?eqRads:[12]);
-      const minR = Math.max(6, R*0.45);
-      const maxR = Math.min(Math.min(vidW,vidH)*0.12, R*2.4);
-
-      dets.sort((a,b)=>b.r1-a.r1); const merged=[]; const used=new Array(dets.length).fill(false);
-      for(let i=0;i<dets.length;i++){
-        if(used[i]) continue; const a=dets[i];
-        const big = Math.max(a.r1,a.r2); const small=Math.min(a.r1,a.r2);
-        if(big>maxR || small<minR*0.6){ used[i]=true; continue; }
-        merged.push(a); used[i]=true;
-        for(let j=i+1;j<dets.length;j++){
-          if(used[j]) continue; const b=dets[j];
-          const d=Math.hypot(a.x-b.x,a.y-b.y);
-          const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.60;
-          if(d < thr) used[j]=true;
-        }
-      }
-
-      // Block inside lock halos & assign
-      const zones=lockedZones(performance.now());
-      const mergedFiltered = merged.filter(o=>!insideAnyZone(o.x,o.y,zones));
-      assignTracks(mergedFiltered);
-
-      finalMask.delete();
+    // Split touching pills (DT throttled)
+    let finalMask;
+    if((frameIdx % PERF.DT_EVERY)===0 || !cache.dtMask){
+      cv.distanceTransform(fused,dt,cv.DIST_L2,3);
+      const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
+      const kMax = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
+      const maxMap = new cv.Mat(); cv.dilate(dtn,maxMap,kMax);
+      const localMax = new cv.Mat(); cv.compare(dtn, maxMap, localMax, cv.CMP_EQ);
+      localMax.convertTo(localMax, cv.CV_8U, 255);
+      cv.bitwise_and(localMax, fused, localMax);
+      const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.24,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
+      cv.bitwise_or(fg, localMax, fg);
+      cv.morphologyEx(fg, fg, cv.MORPH_ERODE, kSmall);
+      finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
+      // cache
+      cache.dtMask && cache.dtMask.delete(); cache.dtMask = finalMask.clone();
+      dtn.delete(); fg.delete(); localMax.delete(); maxMap.delete();
+    }else{
+      finalMask = cache.dtMask.clone();
     }
 
-    // Draw & count (from tracker only)
+    // Contours (proc space)
+    contours.delete(); contours=new cv.MatVector(); hierarchy.delete(); hierarchy=new cv.Mat();
+    cv.findContours(finalMask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+
+    const gMean = cv.mean(gray)[0];
+    const dets=[]; const eqRads=[];
+    for(let i=0;i<contours.size();i++){
+      const cnt=contours.get(i);
+      const area=cv.contourArea(cnt); if(area<55){ cnt.delete(); continue; }
+      const peri=cv.arcLength(cnt,true);
+      const circ=(4*Math.PI*area)/(peri*peri+1e-6);
+      const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
+      const rect=cv.boundingRect(cnt); const roi=finalMask.roi(rect); const cov=cv.countNonZero(roi)/(rect.width*rect.height); roi.delete();
+
+      const r2=gray.roi(rect); const m=new cv.Mat(); const s=new cv.Mat(); cv.meanStdDev(r2,m,s); const meanG=m.doubleAt(0,0); const stdG=s.doubleAt(0,0); r2.delete(); m.delete(); s.delete();
+
+      let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0; try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
+      const aspect = isEllipse ? Math.min(er1,er2)/Math.max(er1,er2) : 1;
+
+      const roundOK   = (circ>=0.66 && solid>=0.86 && aspect>=0.78);
+      const capsuleOK = (solid>=0.88 && aspect>=0.35 && aspect<0.78);
+      const brightOK  = (meanG > gMean + 3 && stdG < 50);
+      const coverOK   = cov > 0.22;
+
+      let strong=false; let edgeOK=true;
+      if(roundOK){
+        const M=cv.moments(cnt); const cx_p=M.m10/(M.m00||1), cy_p=M.m01/(M.m00||1); const r_p=Math.max(6, Math.sqrt(area/Math.PI));
+        edgeOK = ringEdgeOK(cx_p, cy_p, r_p);
+        strong = edgeOK && brightOK && solid>0.9 && circ>0.72;
+      }
+
+      if(brightOK && coverOK && ( (roundOK && edgeOK) || capsuleOK)){
+        if(roundOK){
+          const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6, Math.sqrt(area/Math.PI)); const Rv=r*Math.sqrt((sX+sY)/2);
+          dets.push({type:'circle', x:cx*sX, y:cy*sY, r1:Rv, r2:Rv, a:0, score:circ*solid, strong}); eqRads.push(Rv);
+        }else{
+          const Rv=Math.max(er1*sX, er2*sY); dets.push({type:'ellipse', x:ex*sX, y:ey*sY, r1:er1*sX, r2:er2*sY, a:eang, score:solid, strong:false}); eqRads.push(Rv);
+        }
+      }
+      hull.delete(); cnt.delete();
+    }
+
+    // Hough circles — run every other frame (and only if needed)
+    let runHough = (frameIdx % PERF.HOUGH_EVERY)===0;
+    if(runHough){
+      const tmp=new cv.Mat(); const circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
+      try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(6, Math.min(procW,procH)*0.05), 180, 40, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
+      for(let i=0;i<circles.cols;i++){
+        const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
+        if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
+        const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy)));
+        if(fused.ucharPtr(py,px)[0]===0) continue;
+        const edgeOK = ringEdgeOK(cx, cy, r); if(!edgeOK) continue;
+        const Rv=r*Math.sqrt((sX+sY)/2);
+        dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95, strong:true}); eqRads.push(Rv);
+      }
+      tmp.delete(); circles.delete();
+    }
+
+    // === Size prior & hard bounds ===
+    if(eqRads.length>=3){ const mid = median(eqRads.filter(v=>isFinite(v))); sizePrior.R = sizePrior.R? (0.7*sizePrior.R+0.3*mid) : mid; }
+    const R = sizePrior.R || median(eqRads.length?eqRads:[12]);
+    const minR = Math.max(6, R*0.45);
+    const maxR = Math.min(Math.min(vidW,vidH)*0.12, R*2.4);
+
+    // Non‑max suppression (video space)
+    dets.sort((a,b)=>b.r1-a.r1); const merged=[]; const used=new Array(dets.length).fill(false);
+    for(let i=0;i<dets.length;i++){
+      if(used[i]) continue; const a=dets[i];
+      const big = Math.max(a.r1,a.r2); const small=Math.min(a.r1,a.r2);
+      if(big>maxR || small<minR*0.6){ used[i]=true; continue; }
+      merged.push(a); used[i]=true;
+      for(let j=i+1;j<dets.length;j++){
+        if(used[j]) continue; const b=dets[j];
+        const d=Math.hypot(a.x-b.x,a.y-b.y);
+        const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.60;
+        if(d < thr) used[j]=true;
+      }
+    }
+
+    // === Block any merged detection that falls inside a lock halo ===
+    const zones=lockedZones(performance.now());
+    const mergedFiltered = merged.filter(o=>!insideAnyZone(o.x,o.y,zones));
+
+    assignTracks(mergedFiltered);
+
+    // ===== DRAW & COUNT FROM TRACKER ONLY (unique) =====
     octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3;
     const now=performance.now();
     let confirmed=0; const toDraw=[];
@@ -406,6 +393,7 @@ function process(){
       if(ok) confirmed++;
       toDraw.push({x:t.x,y:t.y,r1:t.r1||8,r2:t.r2||t.r1||8,a:t.a||0,type:t.type||'circle',ok});
     }
+
     for(const d of toDraw){
       octx.strokeStyle = d.ok ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
       octx.fillStyle   = d.ok ? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
@@ -417,30 +405,11 @@ function process(){
       octx.beginPath(); octx.arc(d.x,d.y,4,0,Math.PI*2); octx.fill();
     }
 
-    // Scheduled final count update every 10s, only while ALL tracks are green & locked
-const totalTracks = tracker.tracks.length;
-const lockedCount = tracker.tracks.filter(t => t.lockedUntil && now < t.lockedUntil).length;
-recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
+    const totalTracks = tracker.tracks.length;
+    recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
+    countEl.textContent = `Confirmed: ${confirmed} / Total: ${median(recentTotals)}`;
 
-const allLocked = totalTracks > 0 && lockedCount === totalTracks;
-if (allLocked) {
-  if (!inAllLocked) { inAllLocked = true; nextCountAt = 0; } // start cycle immediately
-  const nowMs = now;
-  if (nowMs >= nextCountAt) {
-    countLock.value = lockedCount;           // publish new final
-    nextCountAt = nowMs + COUNT_FREEZE_MS;   // schedule next update in 10s
-  }
-} else {
-  inAllLocked = false; // pause schedule until everything is locked again
-}
-
-// Show the latest final number (frozen between 10s updates). If never finalized yet, show ellipsis.
-countEl.textContent = (countLock.value != null) ? `${countLock.value}` : '…';
-
-    // update prev blur for next diff
-    if(prevBlur){ try{ prevBlur.delete(); }catch{} }
-    prevBlur = blur.clone();
-
+    finalMask.delete();
     updateFps(); frameIdx++;
   }catch(e){ console.error(e); showErr(e?.message||String(e)); }
   requestAnimationFrame(process);
@@ -453,7 +422,7 @@ startBtn.addEventListener('click', async()=>{
   if(ok){ const ready=()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); }); } else { startBtn.disabled=false; }
 });
 
-window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin,prevBlur].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
+window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
 </body>
 </html>
