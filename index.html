@@ -431,7 +431,7 @@ function resetAll(){ tracker.tracks=[]; tracker.nextId=1; sizePrior.R=null; fram
 async function refreshCamera(){ running=false; frozen=false; try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch{} stream=null; resetAll(); startBtn.disabled=true; const ok=await startCamera(); if(ok){ syncBuffers(); running=true; frozen=false; startTs=performance.now(); requestAnimationFrame(process); } startBtn.disabled=false; }
 recountBtn.addEventListener('click', refreshCamera);
 
-window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
+window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.grad.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
 </body>
 </html>
