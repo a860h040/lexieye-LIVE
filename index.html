@@ -18,8 +18,8 @@
     .pill{ display:inline-block; padding:4px 10px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff; font-size:1.1rem }
     .err{ color:#b00020; font-size:.95rem; min-height:1.2em }
 
-    .feed{ position:relative; width:100%; max-width:960px; margin-top:10px; overflow:hidden }
-    video{ display:block; width:100%; height:auto; border-radius:18px; border:2px solid var(--primary) }
+    .feed{ position:relative; width:100%; max-width:960px; margin-top:10px; overflow:hidden; aspect-ratio: 4/3 }
+    video{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:block; border-radius:18px; border:2px solid var(--primary) }
     #overlay{ position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; border-radius:18px; z-index:1 }
     #count{ font-size:clamp(3rem,12vw,10rem); font-weight:800; line-height:1; font-variant-numeric:tabular-nums; letter-spacing:.02em }
     #fps{ font-size:1rem }
@@ -33,6 +33,12 @@
       /* Vertical zoom slider on left of camera */
     .zoom-left{ position:absolute; left:8px; top:50%; transform:translateY(-50%); z-index:3; background:rgba(255,255,255,0.55); border:1px solid var(--accent); padding:8px; border-radius:14px; backdrop-filter: blur(8px); }
     .zoom-left .vslider{ width:220px; height:6px; transform:rotate(-90deg); transform-origin:left center; }
+      /* Focus UI */
+    .focus-panel{ position:absolute; left:8px; bottom:12px; z-index:4; background:rgba(255,255,255,0.6); border:1px solid var(--accent); padding:8px; border-radius:14px; backdrop-filter: blur(8px); }
+    .focus-panel .fwrap{ display:flex; align-items:center; gap:8px }
+    .focus-panel .fslider{ width:160px }
+    .btn.sm{ padding:6px 10px; border-radius:12px; font-size:.9rem }
+    .tap-reticle{ position:absolute; width:36px; height:36px; border:2px solid #00c853; border-radius:8px; pointer-events:none; z-index:5; opacity:0; transform:translate(-50%,-50%); transition:opacity .35s ease }
   </style>
 </head>
 <body>
@@ -47,9 +53,23 @@
       <!-- On‑device brightness/exposure slider -->
       <div class="slider-wrap">
         <label for="bright">Brightness</label>
-        <!-- widen range and show percentage -->
         <input id="bright" type="range" min="-100" max="100" step="1" value="0" />
         <span class="pill" id="brightVal">0</span>
+      </div>
+
+      <!-- Zoom controls moved OUTSIDE the camera view -->
+      <div class="slider-wrap">
+        <label for="zoom">Zoom</label>
+        <input id="zoom" type="range" min="100" max="300" step="1" value="100" />
+        <span class="pill" id="zoomVal">100%</span>
+      </div>
+
+      <!-- Focus tools moved OUTSIDE the camera view -->
+      <div class="slider-wrap">
+        <button id="afOnce" class="btn sm" title="Single-shot autofocus">AF</button>
+        <label class="pill" style="display:flex;align-items:center;gap:6px;margin-left:6px"><input id="afLock" type="checkbox"/> Focus lock</label>
+        <input id="focusDist" class="fslider" type="range" min="0" max="100" step="1" value="50" hidden/>
+        <span id="focusVal" class="pill" hidden>—</span>
       </div>
 
       <span class="pill"><b id="count">0</b></span>
@@ -60,9 +80,16 @@
     </div>
     <div class="err" id="err"></div>
     <div class="feed">
-      <div class="zoom-left">
-        <input id="zoom" class="vslider" type="range" min="100" max="300" step="1" value="100" />
+
+      <!-- Focus tools: AF once, Lock, optional manual distance -->
+        <div class="fwrap" style="margin-top:6px">
+          <input id="focusDist" class="fslider" type="range" min="0" max="100" step="1" value="50" hidden/>
+          <span id="focusVal" class="pill" hidden>—</span>
+        </div>
       </div>
+
+      <div id="reticle" class="tap-reticle"></div>
+
       <video id="video" autoplay playsinline muted></video>
       <canvas id="overlay"></canvas>
     </div>
@@ -88,8 +115,14 @@ const fpsEl=document.getElementById('fps');
 const brightEl=document.getElementById('bright');
 const brightVal=document.getElementById('brightVal');
 const zoomEl=document.getElementById('zoom');
+const zoomVal=document.getElementById('zoomVal');
+const afOnceBtn=document.getElementById('afOnce');
+const afLockEl=document.getElementById('afLock');
+const focusEl=document.getElementById('focusDist');
+const focusVal=document.getElementById('focusVal');
+const reticle=document.getElementById('reticle');
 
-let stream=null, running=false, lastTick=performance.now(), frames=0;
+let stream=null, running=false, lastTick=performance.now(), frames=0; let lastCaps=null;
 // zoom/crop state
 let softZoom=1, useSoftZoom=true, cropX=0, cropY=0, cropW=0, cropH=0, offsetX=0, offsetY=0;
 let frameIdx=0;
@@ -174,7 +207,7 @@ async function startCamera(){
 
 function syncBuffers(){
   vidW=video.videoWidth||640; vidH=video.videoHeight||480;
-  overlay.width=vidW; overlay.height=vidH; overlay.style.width=vidW+'px'; overlay.style.height=vidH+'px'; video.style.width=vidW+'px';
+  overlay.width=vidW; overlay.height=vidH; overlay.style.width='100%'; overlay.style.height='100%'; video.style.width='100%'; video.style.height='100%';
 
   updateCrop();
 
@@ -319,10 +352,21 @@ function process(){ if(!running) return; try{
   requestAnimationFrame(process);
 }
 
+// ===== Focus helpers =====
+function showReticle(x,y){ if(!reticle||!video) return; const r=video.getBoundingClientRect(); reticle.style.left=(x - r.left)+'px'; reticle.style.top=(y - r.top)+'px'; reticle.style.opacity='1'; setTimeout(()=>{ reticle && (reticle.style.opacity='0'); }, 450); }
+async function setupFocusUI(track){ try{ const caps = track.getCapabilities ? track.getCapabilities() : {}; lastCaps=caps; const hasFM=!!caps.focusMode; const hasFD=!!caps.focusDistance; if(afOnceBtn){ afOnceBtn.style.display = hasFM ? '' : 'none'; }
+  if(afLockEl){ afLockEl.parentElement.style.display = hasFM ? 'flex' : 'none'; }
+  if(focusEl && focusVal){ if(hasFD){ focusEl.hidden=false; focusVal.hidden=false; focusVal.textContent='50'; } else { focusEl.hidden=true; focusVal.hidden=true; } }
+}catch(e){}
+}
+async function applySingleShotAF(){ try{ if(!stream) return; const track=stream.getVideoTracks()[0]; const caps=track.getCapabilities?track.getCapabilities():{}; if(caps.focusMode){ await track.applyConstraints({ advanced:[{ focusMode:'single-shot' }] }); } }catch(e){ /* ignore */ } }
+async function setFocusLock(on){ try{ if(!stream) return; const track=stream.getVideoTracks()[0]; const caps=track.getCapabilities?track.getCapabilities():{}; if(on){ if(caps.focusMode && caps.focusMode.indexOf && caps.focusMode.indexOf('manual')>=0 && caps.focusDistance){ const {min,max}=caps.focusDistance; const pct=(Number(focusEl?.value)||50)/100; const val=min + pct*(max-min); await track.applyConstraints({ advanced:[{ focusMode:'manual', focusDistance: val }] }); } else if(caps.focusMode){ await track.applyConstraints({ advanced:[{ focusMode:'single-shot' }] }); } } else { if(caps.focusMode){ await track.applyConstraints({ advanced:[{ focusMode:'continuous' }] }); } } }catch(e){ /* ignore */ } }
+async function setManualFocusBySlider(){ try{ if(!stream||!focusEl) return; const track=stream.getVideoTracks()[0]; const caps=track.getCapabilities?track.getCapabilities():{}; if(caps.focusDistance){ const {min,max}=caps.focusDistance; const pct=(Number(focusEl.value)||50)/100; const val=min + pct*(max-min); focusVal.textContent = String(Math.round(pct*100)); await track.applyConstraints({ advanced:[{ focusMode: (caps.focusMode?'manual':undefined), focusDistance: val }] }); if(afLockEl) afLockEl.checked = true; } }catch(e){ /* ignore */ } }
+
 window.cv=window.cv||{}; cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
 
 startBtn.addEventListener('click', async()=>{
-  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { showErr('Could not start the camera.'); } startBtn.disabled=false; });
+  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); try{ setupFocusUI(stream.getVideoTracks()[0]); }catch{} running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { showErr('Could not start the camera.'); } startBtn.disabled=false; });
 window.addEventListener('resize', ()=>{ if(video.videoWidth) syncBuffers(); });
 
 // ===== Zoom control (left-side slider) =====
@@ -341,6 +385,7 @@ function updateCrop(){
 async function applyZoomFromSlider(){
   if(!zoomEl) return;
   const pct = Number(zoomEl.value)||100; const z = Math.max(1, pct/100);
+  if(zoomVal){ zoomVal.textContent = `${pct}%`; }
   softZoom = z; useSoftZoom = true;
   try{
     if(stream){
@@ -356,6 +401,10 @@ async function applyZoomFromSlider(){
   updateCrop(); syncBuffers();
 }
 if(zoomEl){ zoomEl.addEventListener('input', applyZoomFromSlider); }
+if(afOnceBtn){ afOnceBtn.addEventListener('click', ()=>applySingleShotAF()); }
+afLockEl && afLockEl.addEventListener('change', ()=> setFocusLock(afLockEl.checked));
+focusEl && focusEl.addEventListener('input', ()=> setManualFocusBySlider());
+video.addEventListener('click', (e)=>{ showReticle(e.clientX, e.clientY); applySingleShotAF(); });
 
 // Brightness slider -> try hardware exposure first; fallback to software + preview
 brightEl.addEventListener('input', () => {
