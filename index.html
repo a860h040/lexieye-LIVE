@@ -31,7 +31,7 @@
     <div class="controls">
       <button id="startBtn" class="btn">Enable Camera & Start</button>
       <div class="spacer"></div>
-      <span class="pill">Detected: <b id="count">0</b></span>
+      <span class="pill"><b id="count">0</b></span>
       <span class="pill" id="fps">0 fps</span>
       <button id="recountBtn" class="btn">Recount Final</button>
     </div>
@@ -57,15 +57,25 @@ const fpsEl=document.getElementById('fps');
 
 let stream=null, running=false, lastTick=performance.now(), frames=0;
 let recentTotals=[]; // smoothing for total only
+let recentOk=[];     // smoothing for ok (green) count
 let frameIdx=0;      // frame counter for throttled ops
-let recountFreezeUntil = 0; // freeze display for 10s after manual recount
+const COUNT_FREEZE_MS = 10000; // 10s freeze for final number
+let countLock = { value: 0, until: 0 }; // final number lock
+// --- 5s deadline + early-stability freeze
+const DEADLINE_MS = 5000;      // hard deadline to deliver a final
+const SPRINT_MS   = 3500;      // first ~3.5s: aggressive fast path
+const STABLE_WINDOW = 8;       // frames window for stability check
+let startTs = 0;               // when a run started
+let frozen = false;            // stop heavy work when frozen
+let stableCounts = [];         // ring-count history for stability
 
 // Process size for speed
-const PROC_MAX_W = 280; // big speedup
+const PROC_MAX_W = 384; // big speedup
 let procW=0, procH=0, vidW=0, vidH=0, sX=1, sY=1;
 
 // Perf throttles
-const PERF={ DT_EVERY:2, GRAD_EVERY:2, HOUGH_EVERY:2, CLAHE_EVERY:2 };
+const PERF={ DT_EVERY:2, GRAD_EVERY:2, HOUGH_EVERY:3, CLAHE_EVERY:3 };
+const LAB_EVERY=3, LC_EVERY=3, GLARE_EVERY=3, RECALL_IF_LT=12;
 
 // Size prior (auto‑learned)
 const sizePrior = { R:null };
@@ -74,24 +84,36 @@ const sizePrior = { R:null };
 const LOCK_MS = 10000; // 10 seconds
 const LOCK_HALO_SCALE = 1.25; // halo radius = max(r1,r2)*scale + pad
 const LOCK_HALO_PAD   = 8;    // extra pixels
+// Hysteresis so green doesn't drop on brief misses
+const STICK_MS = 600000;           // keep a pill green up to 10 minutes after last confirmation (sticky hold)
+const MIN_LOCK_MS = 2000;           // NEW: each OK pill stays green at least 2s
+const DELETE_BASE_MS = 6000;     // keep unseen (but recently OK) tracks for up to 6s
+
+// --- Temporal correction memory (remembers detections & helps relock)
+const MEM_CELL = 10;          // proc pixels per memory cell (~grid resolution)
+const MEM_DECAY = 0.94;       // per-frame decay (closer to 1 = longer memory)
+const MEM_HIT = 1.0;          // deposit for a detection hit (center cell)
+const MEM_HIT_NEIGH = 0.5;    // deposit for 8-neighbors
+const MEM_SPAWN_THRESH = 3.2; // when a cell exceeds this, spawn a corrective detection
 
 // === Edge‑ring validation params ===
 const EDGE_RING_MIN_PX = 2;         // minimum ring thickness in processing pixels
 const EDGE_RING_THICK_SCALE = 0.22; // thickness = scale * radius (clamped by min above)
-const EDGE_MIN_COVER   = 0.33;      // fraction of rim pixels that must be strong edge
-const EDGE_BIN_BIAS    = 8;         // threshold = meanGrad + bias
+const EDGE_MIN_COVER   = 0.20;      // easier edge coverage
+const EDGE_BIN_BIAS    = 2;         // lower gradient threshold for weak edges           // easier gradient threshold for weak edges         // threshold = meanGrad + bias
 
 // Offscreen buffer
 const work=document.createElement('canvas');
 const wctx=work.getContext('2d');
 
 // OpenCV mats (proc size)
-let src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt;
+let src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask;
 let contours,hierarchy,kSmall,kBig,clahe;
 let sobelX,sobelY,absX,absY,grad,gradBin; // for edge ring test
 
 // Caches to avoid recomputing every frame
-const cache={ grad:null, gradBin:null, dtMask:null };
+const cache={ grad:null, gradBin:null, dtMask:null, labMask:null, lcMask:null, glare:null };
+let mem = { w:0, h:0, cells:null }; // memory grid
 
 function showErr(m){ errEl.textContent=m||''; console.error(m); }
 function odd(n){ return (n%2)?n:n+1; }
@@ -110,7 +132,23 @@ async function startCamera(){
     if(back) tries.unshift({video:{deviceId:{exact:back.deviceId}, width:{ideal:1280}, height:{ideal:720}}, audio:false});
   }catch{}
   for(const c of tries){
-    try{ stream=await navigator.mediaDevices.getUserMedia(c); video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play(); return true; }
+    try{
+      stream=await navigator.mediaDevices.getUserMedia(c);
+      video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play();
+      // Try to maximize useful exposure/white balance/torch when supported
+      try{
+        const track = stream.getVideoTracks()[0];
+        const caps  = track.getCapabilities ? track.getCapabilities() : {};
+        const adv=[];
+        if(caps.exposureMode) adv.push({exposureMode:'continuous'});
+        if(caps.whiteBalanceMode) adv.push({whiteBalanceMode:'continuous'});
+        if(caps.focusMode) adv.push({focusMode:'continuous'});
+        if(caps.exposureCompensation) adv.push({exposureCompensation:caps.exposureCompensation.max});
+        if(caps.torch) adv.push({torch:true});
+        if(adv.length) track.applyConstraints({advanced:adv}).catch(()=>{});
+      }catch{}
+      return true;
+    }
     catch(e){ console.warn('gUM fail',c,e); }
   }
   showErr('Could not start the camera. Use HTTPS or localhost.');
@@ -138,6 +176,7 @@ function syncOverlayAndBuffers(){
   adaptive=new cv.Mat(procH,procW,cv.CV_8UC1);
   hsvMask=new cv.Mat(procH,procW,cv.CV_8UC1);
   fused=new cv.Mat(procH,procW,cv.CV_8UC1);
+  glareMask=new cv.Mat(procH,procW,cv.CV_8UC1);
   dt=new cv.Mat(procH,procW,cv.CV_32F);
   contours=new cv.MatVector();
   hierarchy=new cv.Mat();
@@ -146,21 +185,50 @@ function syncOverlayAndBuffers(){
   kSmall=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(ks,ks));
   kBig  =cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(kb,kb));
   try{ clahe=cv.createCLAHE(2.0, new cv.Size(8,8)); }catch{}
+  initMemory();
 }
 
 function updateFps(){ frames++; const now=performance.now(); if(now-lastTick>=1000){ fpsEl.textContent=`${frames} fps`; frames=0; lastTick=now; } }
+function freezeNow(final){ const now=performance.now(); for(const t of tracker.tracks){ t.lockedUntil = now + COUNT_FREEZE_MS; t.okSince = t.okSince || now; t.okHoldUntil = now + COUNT_FREEZE_MS; } countEl.textContent = String(final); countLock={value:final, until: now + COUNT_FREEZE_MS}; frozen=true; running=false; }
 
 function hsvBrightMask(){
   const chs=new cv.MatVector(); cv.split(hsv,chs); const S=chs.get(1), V=chs.get(2);
   const meanV=cv.mean(V)[0];
-  const vMin=Math.max(86, Math.round(meanV+4));
-  const sMax=130;
+  const vMin=Math.max(60, Math.round(meanV-6));
+  const sMax=170;
   const vMask=new cv.Mat(), sMask=new cv.Mat();
   cv.threshold(V,vMask,vMin,255,cv.THRESH_BINARY);
   cv.threshold(S,sMask,sMax,255,cv.THRESH_BINARY_INV);
   cv.bitwise_and(vMask,sMask,hsvMask);
   cv.morphologyEx(hsvMask,hsvMask,cv.MORPH_OPEN,kSmall);
   vMask.delete(); sMask.delete(); S.delete(); V.delete(); chs.delete();
+}
+
+// Glare/highlight mask (very bright & desaturated)
+function buildGlareMask(){
+  const chs=new cv.MatVector(); cv.split(hsv, chs);
+  const S=chs.get(1), V=chs.get(2);
+  const hi=new cv.Mat(), lowS=new cv.Mat();
+  cv.threshold(V, hi, 240, 255, cv.THRESH_BINARY);
+  cv.threshold(S, lowS, 25, 255, cv.THRESH_BINARY_INV);
+  cv.bitwise_and(hi, lowS, glareMask);
+  // grow a little so halos are fully excluded
+  const k=cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
+  cv.dilate(glareMask, glareMask, k);
+  k.delete(); hi.delete(); lowS.delete(); S.delete(); V.delete(); chs.delete();
+}
+
+// Local-contrast mask (shadow-robust). Bright blobs above local mean.
+function buildLocalContrastMask(){
+  const med = new cv.Mat(); const mean = new cv.Mat(); const diff = new cv.Mat(); const out = new cv.Mat();
+  cv.medianBlur(gray, med, 7);
+  cv.blur(med, mean, new cv.Size(31,31));
+  cv.subtract(gray, mean, diff); // positive when brighter than local BG
+  const abs = new cv.Mat(); cv.convertScaleAbs(diff, abs, 2.0, 0);
+  cv.threshold(abs, out, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU);
+  cv.morphologyEx(out, out, cv.MORPH_OPEN, kSmall);
+  med.delete(); mean.delete(); diff.delete(); abs.delete();
+  return out;
 }
 
 // === Edge‑ring test helpers (PROC space) ===
@@ -173,7 +241,6 @@ function buildGradients(){
     cv.addWeighted(absX, 0.5, absY, 0.5, 0, grad);
     const gMean=cv.mean(grad)[0];
     cv.threshold(grad, gradBin, Math.max(20, gMean + EDGE_BIN_BIAS), 255, cv.THRESH_BINARY);
-    // update cache
     cache.grad && cache.grad.delete(); cache.gradBin && cache.gradBin.delete();
     cache.grad = grad.clone(); cache.gradBin = gradBin.clone();
   } else {
@@ -181,7 +248,38 @@ function buildGradients(){
   }
 }
 
+// Multi-scale DoG proposals (recall booster)
+function dogProposals(){
+  const g1=new cv.Mat(), g2=new cv.Mat(), dog=new cv.Mat(), dogBin=new cv.Mat();
+  cv.GaussianBlur(gray, g1, new cv.Size(0,0), 1.2);
+  cv.GaussianBlur(gray, g2, new cv.Size(0,0), 3.0);
+  cv.subtract(g1, g2, dog);
+  dog.convertTo(dog, cv.CV_8U, 3.0, 128);
+  cv.threshold(dog, dogBin, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU);
+  cv.morphologyEx(dogBin, dogBin, cv.MORPH_OPEN, kSmall);
+  const vec=new cv.MatVector(); const hier=new cv.Mat(); const out=[];
+  cv.findContours(dogBin, vec, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+  for(let i=0;i<vec.size();i++){
+    const c=vec.get(i); const a=cv.contourArea(c); if(a<18){ c.delete(); continue; }
+    const M=cv.moments(c); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
+    const r=Math.max(5, Math.sqrt(a/Math.PI));
+    if(!regionContrastOK(cx,cy,r)) { c.delete(); continue; }
+    if(!ringEdgeOK(cx,cy,r)) { c.delete(); continue; }
+    const Rv=r*Math.sqrt((sX+sY)/2);
+    out.push({type:'circle', x:cx*sX, y:cy*sY, r1:Rv, r2:Rv, a:0, score:0.6, strong:true});
+    c.delete();
+  }
+  vec.delete(); hier.delete(); g1.delete(); g2.delete(); dog.delete(); dogBin.delete();
+  return out;
+}
+
 function ringEdgeOK(cx, cy, r){
+  // reject if center lies in glare
+  if (glareMask) {
+    const py = Math.max(0, Math.min(procH-1, Math.round(cy)));
+    const px = Math.max(0, Math.min(procW-1, Math.round(cx)));
+    try{ if (glareMask.ucharPtr(py,px)[0] > 0) return false; }catch{}
+  }
   const R = Math.max(3, Math.round(r));
   const t = Math.max(EDGE_RING_MIN_PX, Math.round(R * EDGE_RING_THICK_SCALE));
   const x0 = Math.max(0, Math.round(cx - R - t));
@@ -202,10 +300,67 @@ function ringEdgeOK(cx, cy, r){
   return (c1/Math.max(1,c0)) > EDGE_MIN_COVER;
 }
 
+// Interior vs background contrast test using gray image
+function regionContrastOK(cx, cy, r){
+  const R = Math.max(4, Math.round(r));
+  const t = Math.max(2, Math.round(R*0.25));
+  const x0 = Math.max(0, Math.round(cx - R - t - 2));
+  const y0 = Math.max(0, Math.round(cy - R - t - 2));
+  const w  = Math.min(procW - x0, 2*(R+t)+5);
+  const h  = Math.min(procH - y0, 2*(R+t)+5);
+  const cxr = Math.round((cx - x0));
+  const cyr = Math.round((cy - y0));
+  const inner = cv.Mat.zeros(h, w, cv.CV_8UC1);
+  const outer = cv.Mat.zeros(h, w, cv.CV_8UC1);
+  cv.circle(inner, new cv.Point(cxr, cyr), Math.max(2, R-1), new cv.Scalar(255,255,255,255), -1);
+  cv.circle(outer, new cv.Point(cxr, cyr), R + t, new cv.Scalar(255,255,255,255), -1);
+  const ring = new cv.Mat(); cv.subtract(outer, inner, ring);
+  const gROI = gray.roi(new cv.Rect(x0, y0, w, h));
+  const mIn = new cv.Mat(), sIn = new cv.Mat();
+  cv.meanStdDev(gROI, mIn, sIn, inner);
+  const mOut = new cv.Mat(), sOut = new cv.Mat();
+  cv.meanStdDev(gROI, mOut, sOut, ring);
+  const meanIn = mIn.doubleAt(0,0), stdIn = sIn.doubleAt(0,0);
+  const meanOut = mOut.doubleAt(0,0), stdOut = sOut.doubleAt(0,0);
+  inner.delete(); outer.delete(); ring.delete(); gROI.delete(); mIn.delete(); sIn.delete(); mOut.delete(); sOut.delete();
+  const noise = stdOut;
+  const minGap = Math.max(6, 2.0*noise); // adaptive to local noise
+  const maxStdIn = Math.max(50, 1.2*noise + 22);
+  return (meanIn - meanOut) >= minGap && stdIn < maxStdIn;
+}
+
+// === Memory helpers ===
+function initMemory(){
+  mem.w = Math.max(1, Math.round(procW / MEM_CELL));
+  mem.h = Math.max(1, Math.round(procH / MEM_CELL));
+  mem.cells = new Float32Array(mem.w * mem.h);
+}
+function decayMemory(){ if(!mem.cells) return; const a=mem.cells; for(let i=0;i<a.length;i++){ a[i]*=MEM_DECAY; if(a[i]<0.01) a[i]=0; } }
+function depositMemory(cx, cy){ if(!mem.cells) return; const cellW=procW/mem.w, cellH=procH/mem.h; const ix=Math.max(0, Math.min(mem.w-1, Math.floor(cx / cellW))); const iy=Math.max(0, Math.min(mem.h-1, Math.floor(cy / cellH))); const i=iy*mem.w+ix; mem.cells[i]+=MEM_HIT; for(let dy=-1; dy<=1; dy++){ for(let dx=-1; dx<=1; dx++){ if(dx===0&&dy===0) continue; const jx=ix+dx, jy=iy+dy; if(jx>=0&&jx<mem.w&&jy>=0&&jy<mem.h){ mem.cells[jy*mem.w + jx]+=MEM_HIT_NEIGH; } } } }
+function spawnFromMemory(){ const out=[]; if(!mem.cells) return out; const cellW=procW/mem.w, cellH=procH/mem.h; for(let y=0;y<mem.h;y++){ for(let x=0;x<mem.w;x++){ const v=mem.cells[y*mem.w+x]; if(v>=MEM_SPAWN_THRESH){ const cx=(x+0.5)*cellW, cy=(y+0.5)*cellH; const rproc=Math.max(6, (sizePrior.R||12)/Math.sqrt((sX+sY)/2)); if(regionContrastOK(cx,cy,rproc*0.9) && ringEdgeOK(cx,cy,rproc*0.9)){ out.push({cx,cy}); } mem.cells[y*mem.w+x]=0; } } } return out; }
+
 // === Tracker with 10s hard lock ===
 const tracker={tracks:[], nextId:1};
 function lockedZones(now){
-  const zones=[]; for(const t of tracker.tracks){ if(t.lockedUntil && now < t.lockedUntil){ const R = Math.max(t.r1||8, t.r2||8)*LOCK_HALO_SCALE + LOCK_HALO_PAD; zones.push({x:t.x,y:t.y,R}); } } return zones;
+  const zones=[];
+  for(const t of tracker.tracks){
+    // Maintain/refresh overlapping locks
+    if(t.lockedUntil && now < t.lockedUntil){
+      if(t.refreshAt==null) t.refreshAt=(t.firstConfirmedAt||now)+LOCK_MS/2;
+      if(now >= t.refreshAt && (t.matched || (now - t.seen) < 200)){
+        t.lockedUntil = now + LOCK_MS;
+        t.refreshAt   = now + LOCK_MS/2;
+      }
+      // Halo to prevent duplicate detections on the same pill
+      const R = Math.max(t.r1||8, t.r2||8)*LOCK_HALO_SCALE + LOCK_HALO_PAD;
+      zones.push({x:t.x, y:t.y, R});
+    }
+    // Sticky: once OK, keep alive; ensure at least 2s hold
+    if(t.okSince){ t.okHoldUntil = Math.max(t.okHoldUntil||0, now + MIN_LOCK_MS); }
+  }
+  // increment misses for unmatched tracks
+  for(const t of tracker.tracks){ if(!t.matched){ t.misses=(t.misses||0)+1; } }
+  return zones;
 }
 function insideAnyZone(x,y,zs){ for(const z of zs){ if(Math.hypot(x-z.x,y-z.y) <= z.R) return true; } return false; }
 
@@ -227,19 +382,32 @@ function assignTracks(dets){
     if(best){
       best.x=0.7*best.x+0.3*d.x; best.y=0.7*best.y+0.3*d.y;
       best.r1=0.7*(best.r1||d.r1)+0.3*d.r1; best.r2=0.7*(best.r2||d.r2)+0.3*d.r2; best.a=d.a; best.type=d.type;
-      best.seen=now; best.matched=true; best.age=(best.age||0)+1;
-      if(d.strong && !best.firstConfirmedAt){ best.firstConfirmedAt=now; best.lockedUntil=now+LOCK_MS; }
+      best.seen=now; best.matched=true; best.age=(best.age||0)+1; best.misses=0;
+      if(d.strong && !best.firstConfirmedAt){ best.firstConfirmedAt=now; best.lockedUntil=now+LOCK_MS; best.refreshAt=now+LOCK_MS/2; }
+      // Hysteresis: once stable, hold green for STICK_MS even if detection flickers
+      if((best.age||0)>=2 || best.firstConfirmedAt){ if(!best.okSince) best.okSince=now; best.okHoldUntil = Math.max(best.okHoldUntil||0, now + MIN_LOCK_MS); }
     }else{
       if(!insideAnyZone(d.x,d.y,zones)){
-        const nt={ id:tracker.nextId++, x:d.x, y:d.y, r1:d.r1, r2:d.r2, a:d.a, type:d.type||'circle', seen:now, matched:true, age:(d.strong?2:1), firstConfirmedAt:(d.strong?now:null), lockedUntil:(d.strong?now+LOCK_MS:null) };
+        const nt={ id:tracker.nextId++, x:d.x, y:d.y, r1:d.r1, r2:d.r2, a:d.a, type:d.type||'circle', seen:now, matched:true, age:(d.strong?2:1), firstConfirmedAt:(d.strong?now:null), lockedUntil:(d.strong?now+LOCK_MS:null), refreshAt:(d.strong?now+LOCK_MS/2:null), misses:0, okSince:(d.strong?now:null), okHoldUntil:(d.strong?now+MIN_LOCK_MS:null) };
         tracker.tracks.push(nt);
       }
     }
   }
 
-  for(const t of tracker.tracks){ if(!t.firstConfirmedAt && (t.age||0)>=2){ t.firstConfirmedAt=now; t.lockedUntil=now+LOCK_MS; } }
+  for(const t of tracker.tracks){ if(!t.firstConfirmedAt && (t.age||0)>=2){ t.firstConfirmedAt=now; t.lockedUntil=now+LOCK_MS; t.refreshAt=now+LOCK_MS/2; } }
 
-  tracker.tracks = tracker.tracks.filter(t=>{ const ttl = (t.lockedUntil && now < t.lockedUntil) ? (LOCK_MS + 3000) : 1200; return (now - t.seen) < ttl; });
+  // Overlapping lock refresh every 5s (half of LOCK_MS)
+  for(const t of tracker.tracks){
+    if(t.lockedUntil && now < t.lockedUntil){
+      if(t.refreshAt==null) t.refreshAt=(t.firstConfirmedAt||now)+LOCK_MS/2;
+      if(now >= t.refreshAt && (t.matched || (now - t.seen) < 200)){
+        t.lockedUntil = now + LOCK_MS; // extend lock another 10s
+        t.refreshAt   = now + LOCK_MS/2; // schedule next refresh in 5s
+      }
+    }
+  }
+
+  tracker.tracks = tracker.tracks.filter(t=>{ if ((t.lockedUntil && now < t.lockedUntil) || (t.okHoldUntil && now < t.okHoldUntil)) return true; const life = now - t.seen; const ttl = (t.okSince ? DELETE_BASE_MS : 1500); return life < ttl; });
 }
 
 function process(){
@@ -265,21 +433,45 @@ function process(){
     cv.GaussianBlur(enh,blur,new cv.Size(5,5),1.05,1.05);
     opened.delete(); closed.delete(); tophat.delete(); blackhat.delete(); enh.delete();
 
-    // Build gradients for edge‑ring test (cached every other frame)
+    // Build gradients for edge‑ring test (cached)
+    const elapsed = performance.now() - startTs;
+    const sprintNow = !frozen && elapsed < SPRINT_MS;
     buildGradients();
 
     // Masks & fusion: (Otsu ∧ Adaptive) ∨ HSV
     cv.threshold(blur,mask,0,255,cv.THRESH_BINARY+cv.THRESH_OTSU);
-    const block = odd(Math.max(9, Math.round(Math.min(procW,procH)*0.09)));
+    const block = odd(Math.max(9, Math.round(Math.min(procW,procH)*0.06)));
     cv.adaptiveThreshold(blur,adaptive,255,cv.ADAPTIVE_THRESH_MEAN_C,cv.THRESH_BINARY,block,5);
-    hsvBrightMask();
     const both = new cv.Mat(); cv.bitwise_and(mask,adaptive,both);
-    cv.bitwise_or(both,hsvMask,fused); both.delete();
+    if(!sprintNow){ hsvBrightMask(); cv.bitwise_or(both,hsvMask,fused); } else { both.copyTo(fused); }
+    both.delete();
+    // LAB / Local-contrast masks (cached; recompute every few frames)
+    if(!sprintNow && ((frameIdx % LAB_EVERY)===0 || !cache.labMask)) {
+      const lab = new cv.Mat(); const labSplit = new cv.MatVector();
+      cv.cvtColor(rgb, lab, cv.COLOR_RGB2Lab);
+      cv.split(lab, labSplit);
+      const L = labSplit.get(0);
+      const lMask = new cv.Mat(); cv.threshold(L, lMask, 0, 255, cv.THRESH_BINARY+cv.THRESH_OTSU);
+      cv.morphologyEx(lMask, lMask, cv.MORPH_OPEN, kSmall);
+      cache.labMask && cache.labMask.delete(); cache.labMask = lMask.clone();
+      L.delete(); labSplit.delete(); lab.delete(); lMask.delete();
+    }
+    if(!sprintNow && cache.labMask) cv.bitwise_or(fused, cache.labMask, fused);
+
+    if(!sprintNow && ((frameIdx % LC_EVERY)===0 || !cache.lcMask)) {
+      const m = buildLocalContrastMask();
+      cache.lcMask && cache.lcMask.delete(); cache.lcMask = m.clone(); m.delete();
+    }
+    if(!sprintNow && cache.lcMask) cv.bitwise_or(fused, cache.lcMask, fused);
     cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
+
+    // Remove specular highlights (cached)
+    if(!sprintNow){ if ((frameIdx % GLARE_EVERY)===0 || !cache.glare) { buildGlareMask(); cache.glare && cache.glare.delete(); cache.glare = glareMask.clone(); }
+      const gMat = cache.glare || glareMask; const invGlare = new cv.Mat(); cv.bitwise_not(gMat, invGlare); cv.bitwise_and(fused, invGlare, fused); invGlare.delete(); }
 
     // Split touching pills (DT throttled)
     let finalMask;
-    if((frameIdx % PERF.DT_EVERY)===0 || !cache.dtMask){
+    if(sprintNow || (frameIdx % PERF.DT_EVERY)===0 || !cache.dtMask){
       cv.distanceTransform(fused,dt,cv.DIST_L2,3);
       const dtn = new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
       const kMax = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5,5));
@@ -287,7 +479,7 @@ function process(){
       const localMax = new cv.Mat(); cv.compare(dtn, maxMap, localMax, cv.CMP_EQ);
       localMax.convertTo(localMax, cv.CV_8U, 255);
       cv.bitwise_and(localMax, fused, localMax);
-      const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.24,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
+      const fg  = new cv.Mat(); cv.threshold(dtn,fg,0.20,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
       cv.bitwise_or(fg, localMax, fg);
       cv.morphologyEx(fg, fg, cv.MORPH_ERODE, kSmall);
       finalMask = new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
@@ -306,7 +498,7 @@ function process(){
     const dets=[]; const eqRads=[];
     for(let i=0;i<contours.size();i++){
       const cnt=contours.get(i);
-      const area=cv.contourArea(cnt); if(area<55){ cnt.delete(); continue; }
+      const area=cv.contourArea(cnt); if(area<18){ cnt.delete(); continue; }
       const peri=cv.arcLength(cnt,true);
       const circ=(4*Math.PI*area)/(peri*peri+1e-6);
       const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
@@ -317,19 +509,22 @@ function process(){
       let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0; try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
       const aspect = isEllipse ? Math.min(er1,er2)/Math.max(er1,er2) : 1;
 
-      const roundOK   = (circ>=0.66 && solid>=0.86 && aspect>=0.78);
-      const capsuleOK = (solid>=0.88 && aspect>=0.35 && aspect<0.78);
-      const brightOK  = (meanG > gMean + 3 && stdG < 50);
-      const coverOK   = cov > 0.22;
+      const roundOK   = (circ>=0.58 && solid>=0.82 && aspect>=0.70);
+      const capsuleOK = (solid>=0.86 && aspect>=0.30 && aspect<0.80);
+      const brightOK  = (meanG > gMean - 8 && stdG < 95);
+      const coverOK   = cov > 0.06;
 
       let strong=false; let edgeOK=true;
       if(roundOK){
         const M=cv.moments(cnt); const cx_p=M.m10/(M.m00||1), cy_p=M.m01/(M.m00||1); const r_p=Math.max(6, Math.sqrt(area/Math.PI));
         edgeOK = ringEdgeOK(cx_p, cy_p, r_p);
-        strong = edgeOK && brightOK && solid>0.9 && circ>0.72;
       }
+      let contrastOK=false; const coreStdOK = stdG < 50;
+      if(roundOK){ const M2=cv.moments(cnt); const cx2=M2.m10/(M2.m00||1), cy2=M2.m01/(M2.m00||1); const r2p=Math.max(6, Math.sqrt(area/Math.PI)); contrastOK = regionContrastOK(cx2, cy2, r2p); }
+      else if(capsuleOK && isEllipse){ const rr = Math.max(er1, er2); contrastOK = regionContrastOK(ex, ey, rr); }
+      strong = ((edgeOK || contrastOK) && brightOK && coreStdOK && solid>0.82 && circ>0.60);
 
-      if(brightOK && coverOK && ( (roundOK && edgeOK) || capsuleOK)){
+      if(coverOK && ((roundOK && (edgeOK || contrastOK) && brightOK && coreStdOK) || (capsuleOK && contrastOK && brightOK))){
         if(roundOK){
           const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6, Math.sqrt(area/Math.PI)); const Rv=r*Math.sqrt((sX+sY)/2);
           dets.push({type:'circle', x:cx*sX, y:cy*sY, r1:Rv, r2:Rv, a:0, score:circ*solid, strong}); eqRads.push(Rv);
@@ -341,7 +536,7 @@ function process(){
     }
 
     // Hough circles — run every other frame (and only if needed)
-    let runHough = (frameIdx % PERF.HOUGH_EVERY)===0;
+    let runHough = sprintNow ? true : ((frameIdx % PERF.HOUGH_EVERY)===0);
     if(runHough){
       const tmp=new cv.Mat(); const circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
       try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25, Math.max(6, Math.min(procW,procH)*0.05), 180, 40, 5, Math.round(Math.min(procW,procH)*0.25)); }catch{}
@@ -350,7 +545,7 @@ function process(){
         if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
         const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy)));
         if(fused.ucharPtr(py,px)[0]===0) continue;
-        const edgeOK = ringEdgeOK(cx, cy, r); if(!edgeOK) continue;
+        const eOK = ringEdgeOK(cx, cy, r); const cOK = regionContrastOK(cx, cy, r); if(!(eOK || cOK)) continue;
         const Rv=r*Math.sqrt((sX+sY)/2);
         dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95, strong:true}); eqRads.push(Rv);
       }
@@ -360,8 +555,8 @@ function process(){
     // === Size prior & hard bounds ===
     if(eqRads.length>=3){ const mid = median(eqRads.filter(v=>isFinite(v))); sizePrior.R = sizePrior.R? (0.7*sizePrior.R+0.3*mid) : mid; }
     const R = sizePrior.R || median(eqRads.length?eqRads:[12]);
-    const minR = Math.max(6, R*0.45);
-    const maxR = Math.min(Math.min(vidW,vidH)*0.12, R*2.4);
+    const minR = Math.max(5, R*0.35);
+    const maxR = Math.min(Math.min(vidW,vidH)*0.14, R*3.0);
 
     // Non‑max suppression (video space)
     dets.sort((a,b)=>b.r1-a.r1); const merged=[]; const used=new Array(dets.length).fill(false);
@@ -373,16 +568,90 @@ function process(){
       for(let j=i+1;j<dets.length;j++){
         if(used[j]) continue; const b=dets[j];
         const d=Math.hypot(a.x-b.x,a.y-b.y);
-        const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.60;
+        const thr=Math.min(Math.max(a.r1,a.r2), Math.max(b.r1,b.r2))*0.55;
         if(d < thr) used[j]=true;
       }
     }
 
-    // === Block any merged detection that falls inside a lock halo ===
+    // --- Temporal memory: remember seen pills & spawn corrections
+decayMemory();
+for(const a of merged){ depositMemory(a.x/sX, a.y/sY); }
+const memSpawns = spawnFromMemory();
+for(const p of memSpawns){ const Rv=sizePrior.R||12; merged.push({type:'circle', x:p.cx*sX, y:p.cy*sY, r1:Rv, r2:Rv, a:0, score:0.9, strong:true}); }
+
+// === Block any merged detection that falls inside a lock halo ===
     const zones=lockedZones(performance.now());
-    const mergedFiltered = merged.filter(o=>!insideAnyZone(o.x,o.y,zones));
+    let mergedFiltered = merged.filter(o=>!insideAnyZone(o.x,o.y,zones));
+
+    // === Recall booster when too few candidates ===
+    if (mergedFiltered.length < RECALL_IF_LT) {
+      const extra=[]; const exDog = dogProposals(); for (const e of exDog) { const big=Math.max(e.r1,e.r2); if (big>=minR*0.8 && big<=maxR) extra.push(e); }
+      // 1) Relaxed mask: dilate + close
+      const fusedLo = fused.clone();
+      cv.dilate(fusedLo, fusedLo, kSmall);
+      cv.morphologyEx(fusedLo, fusedLo, cv.MORPH_CLOSE, kSmall);
+      const v2 = new cv.MatVector(); const h2 = new cv.Mat();
+      cv.findContours(fusedLo, v2, h2, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+      for(let i=0;i<v2.size();i++){
+        const c=v2.get(i); const a=cv.contourArea(c); if(a<24) { c.delete(); continue; }
+        const M=cv.moments(c); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
+        const r=Math.max(5, Math.sqrt(a/Math.PI));
+        const Rv=r*Math.sqrt((sX+sY)/2);
+        if (Rv>=minR*0.8 && Rv<=maxR && regionContrastOK(cx,cy,r)) { extra.push({type:'circle', x:cx*sX, y:cy*sY, r1:Rv, r2:Rv, a:0, score:0.55, strong:false}); }
+        c.delete();
+      }
+      v2.delete(); h2.delete(); fusedLo.delete();
+
+      // 2) Relaxed Hough (no fused gating)
+      const tmp2 = new cv.Mat(); const cir2 = new cv.Mat();
+      cv.GaussianBlur(blur, tmp2, new cv.Size(3,3), 1.0, 1.0);
+      try{ cv.HoughCircles(tmp2, cir2, cv.HOUGH_GRADIENT, 1.2, Math.max(8, Math.min(procW,procH)*0.04), 160, 28, 4, Math.round(Math.min(procW,procH)*0.26)); }catch{}
+      for(let i=0;i<cir2.cols;i++){
+        const cx=cir2.data32F[i*3], cy=cir2.data32F[i*3+1], r=cir2.data32F[i*3+2];
+        if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
+        if(!ringEdgeOK(cx,cy,r)) continue;
+        if(!regionContrastOK(cx,cy,r)) continue;
+        const Rv=r*Math.sqrt((sX+sY)/2);
+        if (Rv>=minR*0.8 && Rv<=maxR) extra.push({type:'circle', x:cx*sX, y:cy*sY, r1:Rv, r2:Rv, a:0, score:0.8, strong:true});
+      }
+      tmp2.delete(); cir2.delete();
+
+      // Merge with existing and re-apply halo filter + NMS quickly
+      const all = merged.concat(extra);
+      const usedR = new Array(all.length).fill(false);
+      const merged2=[];
+      all.sort((a,b)=>b.score-a.score);
+      for(let i=0;i<all.length;i++){
+        if(usedR[i]) continue; const a=all[i];
+        const d=merged2.find(m=>Math.hypot(m.x-a.x,m.y-a.y) < Math.min(Math.max(m.r1,m.r2),Math.max(a.r1,a.r2))*0.55);
+        if(!d) merged2.push(a);
+        usedR[i]=true;
+      }
+      mergedFiltered = merged2.filter(o=>{ const big=Math.max(o.r1,o.r2); const small=Math.min(o.r1,o.r2); return big<=maxR && small>=minR*0.6 && !insideAnyZone(o.x,o.y,zones); });
+    }
 
     assignTracks(mergedFiltered);
+
+    // De-duplicate tracker entries that land on the same pill (keep the most stable)
+    (function dedupeTracks(){
+      const now=performance.now();
+      const keep=[];
+      // sort so locked/stable tracks are kept first
+      const sorted=[...tracker.tracks].sort((a,b)=>((b.lockedUntil||0)-(a.lockedUntil||0))||((b.okHoldUntil||0)-(a.okHoldUntil||0))||((b.age||0)-(a.age||0)));
+      for(const t of sorted){
+        let dup=false;
+        for(const k of keep){
+          const d=Math.hypot(t.x-k.x, t.y-k.y);
+          const thr=Math.min(Math.max(t.r1||12,t.r2||12), Math.max(k.r1||12,k.r2||12))*0.60;
+          if(d < thr){ dup=true; break; }
+        }
+        if(!dup) keep.push(t);
+      }
+      tracker.tracks = keep;
+    })();
+
+    // Clamp obviously wrong-size tracks (prevents a single giant circle from taking over)
+    tracker.tracks = tracker.tracks.filter(t => { const big=Math.max(t.r1||12,t.r2||12); const small=Math.min(t.r1||12,t.r2||12); return big<=maxR*1.2 && small>=minR*0.5; });
 
     // ===== DRAW & COUNT FROM TRACKER ONLY (unique) =====
     octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3;
@@ -390,10 +659,14 @@ function process(){
     let confirmed=0; const toDraw=[];
     for(const t of tracker.tracks){
       const locked = t.lockedUntil && now < t.lockedUntil;
-      const ok = locked || (t.age||0)>=2;
+      const ok = locked || (t.okSince && now < (t.okHoldUntil||0));
       if(ok) confirmed++;
       toDraw.push({x:t.x,y:t.y,r1:t.r1||8,r2:t.r2||t.r1||8,a:t.a||0,type:t.type||'circle',ok});
     }
+
+    // If not all pills are OK yet, extend the hold of already-OK pills to at least 2s
+    const anyNotOk = tracker.tracks.some(t => !((t.lockedUntil && now < t.lockedUntil) || (t.okSince && now < (t.okHoldUntil||0))));
+    if(anyNotOk){ for(const t of tracker.tracks){ if(t.okSince){ t.okHoldUntil = Math.max(t.okHoldUntil||0, now + MIN_LOCK_MS); } } }
 
     for(const d of toDraw){
       octx.strokeStyle = d.ok ? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
@@ -406,12 +679,13 @@ function process(){
       octx.beginPath(); octx.arc(d.x,d.y,4,0,Math.PI*2); octx.fill();
     }
 
-    const totalTracks = tracker.tracks.length;
-    recentTotals.push(totalTracks); if(recentTotals.length>7) recentTotals.shift();
-    const newText = `${median(recentTotals)}`;
-    if (performance.now() >= recountFreezeUntil) {
-      countEl.textContent = newText;
-    }
+    const tsNow = performance.now();
+// Count everything currently recognized as a pill (green or recently confirmed)
+const okCount = toDraw.filter(d => d.ok).length;
+recentOk.push(okCount); if(recentOk.length>9) recentOk.shift();
+countEl.textContent = String(median(recentOk));
+// Early stability or 5s deadline → freeze
+if(!frozen){ stableCounts.push(okCount); if(stableCounts.length>STABLE_WINDOW) stableCounts.shift(); const min = Math.min(...stableCounts), max = Math.max(...stableCounts); const elapsed2 = performance.now() - startTs; if((stableCounts.length>=STABLE_WINDOW && (max-min)<=1 && elapsed2>1200) || elapsed2>=DEADLINE_MS){ freezeNow(Math.round(median(recentOk))); } }
 
     finalMask.delete();
     updateFps(); frameIdx++;
@@ -422,17 +696,44 @@ function process(){
 window.cv=window.cv||{}; cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
 
 startBtn.addEventListener('click', async()=>{
-  startBtn.disabled=true; const ok=await startCamera();
-  if(ok){ const ready=()=>{ syncOverlayAndBuffers(); running=true; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); window.addEventListener('resize', ()=>{ if(video.videoWidth) syncOverlayAndBuffers(); }); } else { startBtn.disabled=false; }
+  startBtn.disabled = true;
+  const ok = await startCamera();
+  if (ok) {
+    const ready = () => {
+      syncOverlayAndBuffers();
+      running = true; frozen = false; stableCounts.length = 0; startTs = performance.now();
+      requestAnimationFrame(process);
+    };
+    if (video.readyState >= 1) ready();
+    else video.addEventListener('loadedmetadata', ready, { once: true });
+  } else {
+    showErr('Could not start the camera.');
+  }
+  startBtn.disabled = false;
 });
+// Keep overlay sized if the device rotates
+window.addEventListener('resize', ()=>{ if (video.videoWidth) syncOverlayAndBuffers(); });
 
-recountBtn.addEventListener('click', ()=>{
-  const now = performance.now();
-  const total = tracker.tracks.length;
-  const locked = tracker.tracks.filter(t => t.lockedUntil && now < t.lockedUntil).length;
-  countEl.textContent = `Confirmed: ${locked} / Total: ${total}`;
-  recountFreezeUntil = now + 10000; // freeze display for 10s
-});
+function resetState(){
+  tracker.tracks=[]; tracker.nextId=1; sizePrior.R=null; recentTotals.length=0; frameIdx=0; countLock={value:0,until:0};
+  try{ cache.grad&&cache.grad.delete(); cache.grad=null; cache.gradBin&&cache.gradBin.delete(); cache.gradBin=null; cache.dtMask&&cache.dtMask.delete(); cache.dtMask=null; cache.labMask&&cache.labMask.delete(); cache.labMask=null; cache.lcMask&&cache.lcMask.delete(); cache.lcMask=null; cache.glare&&cache.glare.delete(); cache.glare=null; }catch{}
+  mem.cells && mem.cells.fill(0); mem.w=0; mem.h=0;
+  octx.clearRect(0,0,overlay.width,overlay.height);
+  countEl.textContent = '…';
+}
+async function refreshCamera(){
+  running=false; frozen=false; stableCounts.length=0; recentOk.length=0;
+  try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch{}
+  stream=null;
+  resetState();
+  startBtn.disabled=true;
+  const ok = await startCamera();
+  if(ok){ syncOverlayAndBuffers(); running=true; frozen=false; stableCounts.length=0; startTs=performance.now(); requestAnimationFrame(process); }
+  startBtn.disabled=false;
+}
+recountBtn.addEventListener('click', ()=>{ refreshCamera(); });
+// also clear smoothing buffer so number updates immediately on recount
+recountBtn.addEventListener('click', ()=>{ recentOk.length=0; });
 
 window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
