@@ -41,7 +41,7 @@
   <div class="wrap">
     <div class="controls">
       <!-- Keep camera button on the left -->
-      <button id="startBtn" class="btn">Enable Camera & Start</button>
+      <button id="startBtn" class="btn" disabled>Enable Camera & Start</button>
 
       <div class="spacer"></div>
 
@@ -330,13 +330,27 @@ async function refreshCamera(){
   try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch{}
   stream=null; resetAll(); startBtn.disabled=true;
   const ok=await startCamera();
-  if(ok){ syncBuffers(); running=true; frozen=false; startTs=performance.now(); requestAnimationFrame(process); startAutoRefresh(); setTimeout(unlockFeedSize, 300); }
-  else { unlockFeedSize(); }
+  if(ok){
+    syncBuffers(); running=true; frozen=false; startTs=performance.now();
+    requestAnimationFrame(process); startAutoRefresh();
+    setTimeout(unlockFeedSize, 300);
+  } else {
+    unlockFeedSize();
+  }
   startBtn.disabled=false;
-} }catch{} stream=null; resetAll(); startBtn.disabled=true; const ok=await startCamera(); if(ok){ syncBuffers(); running=true; frozen=false; startTs=performance.now(); requestAnimationFrame(process); } startBtn.disabled=false; }
+}
 recountBtn.addEventListener('click', refreshCamera);
 
-window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); try{ cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); }catch{} try{ clearInterval(autoRefreshTimer);}catch{} }); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.grad.delete(); cache.dtMask&&cache.dtMask.delete(); });
+window.addEventListener('beforeunload', ()=>{
+  try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
+  [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{ try{ m && m.delete && m.delete(); }catch{} });
+  try{ cache.grad && cache.grad.delete(); }catch{}
+  try{ cache.gradBin && cache.gradBin.delete(); }catch{}
+  try{ cache.dtMask && cache.dtMask.delete(); }catch{}
+  try{ cache.lcMask && cache.lcMask.delete(); }catch{}
+  try{ cache.glare && cache.glare.delete(); }catch{}
+  try{ clearInterval(autoRefreshTimer); }catch{}
+});
 </script>
 </body>
 </html>
