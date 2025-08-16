@@ -331,6 +331,19 @@ function process(){ if(!running) return; try{
 
 window.cv=window.cv||{}; cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
 
+// Fallback: if OpenCV initialized before this handler or never calls back,
+// poll for readiness and enable the Start button anyway (with guard above).
+(function(){
+  const readyCheck = ()=> (window.cv && typeof cv.Mat === 'function');
+  if(readyCheck()){ startBtn.disabled = false; return; }
+  let attempts = 0; const timer = setInterval(()=>{
+    if(readyCheck()){ startBtn.disabled=false; clearInterval(timer); }
+    else if(++attempts >= 100){ // ~15s fallback
+      startBtn.disabled=false; clearInterval(timer);
+    }
+  }, 150);
+})();
+
 // Soft refresh: reset detection without restarting camera (keeps size stable)
 function softRefreshDetection(){
   frozen=false; running=true; startTs=performance.now();
@@ -347,8 +360,14 @@ function unlockFeedSize(){ const feed=document.querySelector('.feed'); if(!feed)
 
 function startAutoRefresh(){ try{ clearInterval(autoRefreshTimer); }catch{} if(LIVE_MODE) return; autoRefreshTimer=setInterval(()=>{ if(running&&stream){ softRefreshDetection(); } }, DETECTION_REFRESH_MS); }
 
-startBtn.addEventListener('click', async()=>{
-  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; countGateUntil = performance.now() + COUNT_DELAY_MS; countEl.textContent='0'; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { if(!errEl.textContent) showErr('Could not start the camera. Check HTTPS and browser site settings.'); } startBtn.disabled=false; });
+startBtn.addEventListener('click', async()=>{ startBtn.disabled=true;
+  // Guard: ensure OpenCV is ready before starting pipeline
+  if(!(window.cv && typeof cv.Mat === 'function')){
+    showErr('Computer vision engine is still loading. Try again in a moment.');
+    startBtn.disabled=false;
+    return;
+  }
+   const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; countGateUntil = performance.now() + COUNT_DELAY_MS; countEl.textContent='0'; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { if(!errEl.textContent) showErr('Could not start the camera. Check HTTPS and browser site settings.'); } startBtn.disabled=false; });
 window.addEventListener('resize', ()=>{ if(video.videoWidth) syncBuffers(); });
 
 // Brightness slider -> try hardware exposure first; fallback to software "beta"
