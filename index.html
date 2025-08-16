@@ -95,6 +95,10 @@ const COUNT_FREEZE_MS=10000; // hold final number
 const DETECTION_REFRESH_MS=20000;
 let autoRefreshTimer=null;
 
+// Live mode: keep detection running continuously (no final freeze; no auto refresh)
+const LIVE_MODE = true; // set to false to restore freeze & periodic soft refresh
+const LIVE_DROP_MS = 800; // how quickly a pill is considered gone if not seen
+
 // processing sizes
 const PROC_MAX_W=384; let procW=0,procH=0,vidW=0,vidH=0,sX=1,sY=1;
 
@@ -221,7 +225,7 @@ function regionContrastOK(cx,cy,r){ const R=Math.max(4,Math.round(r)); const t=M
 
 // tracker
 const tracker={tracks:[], nextId:1};
-function lockedZones(now){ const zones=[]; for(const t of tracker.tracks){ if(t.lockedUntil && now<t.lockedUntil){ const R=Math.max(t.r1||8,t.r2||8)*LOCK_HALO_SCALE+LOCK_HALO_PAD; zones.push({x:t.x,y:t.y,R}); if(t.refreshAt==null) t.refreshAt=(t.firstConfirmedAt||now)+LOCK_MS/2; if(now>=t.refreshAt && (t.matched || (now-t.seen)<200)){ t.lockedUntil=now+LOCK_MS; t.refreshAt=now+LOCK_MS/2; } } if(t.okSince){ t.okHoldUntil=Math.max(t.okHoldUntil||0, now+MIN_LOCK_MS); } if(!t.matched){ t.misses=(t.misses||0)+1; } } return zones; }
+function lockedZones(now){ if (LIVE_MODE) return []; const zones=[]; for(const t of tracker.tracks){ if(t.lockedUntil && now<t.lockedUntil){ const R=Math.max(t.r1||8,t.r2||8)*LOCK_HALO_SCALE+LOCK_HALO_PAD; zones.push({x:t.x,y:t.y,R}); if(t.refreshAt==null) t.refreshAt=(t.firstConfirmedAt||now)+LOCK_MS/2; if(now>=t.refreshAt && (t.matched || (now-t.seen)<200)){ t.lockedUntil=now+LOCK_MS; t.refreshAt=now+LOCK_MS/2; } } if(t.okSince){ t.okHoldUntil=Math.max(t.okHoldUntil||0, now+MIN_LOCK_MS); } if(!t.matched){ t.misses=(t.misses||0)+1; } } return zones; }
 function insideAnyZone(x,y,zs){ for(const z of zs){ if(Math.hypot(x-z.x,y-z.y)<=z.R) return true; } return false; }
 function assignTracks(dets){ const now=performance.now(); const maxDist=Math.min(vidW,vidH)*0.06; const zones=lockedZones(now); for(const t of tracker.tracks){ t.matched=false; }
   for(const d of dets){ let best=null,bd=1e9; for(const t of tracker.tracks){ const locked=t.lockedUntil && now<t.lockedUntil; if(locked) continue; const dd=Math.hypot(d.x-t.x,d.y-t.y); if(dd<bd && dd<maxDist){ best=t; bd=dd; } } if(best){ best.x=0.7*best.x+0.3*d.x; best.y=0.7*best.y+0.3*d.y; best.r1=0.7*(best.r1||d.r1)+0.3*d.r1; best.r2=0.7*(best.r2||d.r2)+0.3*d.r2; best.a=d.a; best.type=d.type; best.seen=now; best.matched=true; best.age=(best.age||0)+1; best.misses=0; if(d.strong && !best.firstConfirmedAt){ best.firstConfirmedAt=now; best.lockedUntil=now+LOCK_MS; best.refreshAt=now+LOCK_MS/2; } if((best.age||0)>=2 || best.firstConfirmedAt){ if(!best.okSince) best.okSince=now; best.okHoldUntil=Math.max(best.okHoldUntil||0, now+MIN_LOCK_MS); } }
@@ -309,11 +313,11 @@ function process(){ if(!running) return; try{
   tracker.tracks=tracker.tracks.filter(t=>{ const big=Math.max(t.r1||12,t.r2||12), small=Math.min(t.r1||12,t.r2||12); return big<=maxR*1.2 && small>=minR*0.5; });
 
   // draw + count
-  octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; const now=performance.now(); let okCount=0; for(const t of tracker.tracks){ const ok=(t.lockedUntil && now<t.lockedUntil) || (t.okSince && now<(t.okHoldUntil||0)); if(ok) okCount++; octx.strokeStyle= ok? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)'; octx.fillStyle= ok? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)'; if(t.type==='ellipse' && Math.abs(t.r1-t.r2)>1){ octx.beginPath(); octx.ellipse(t.x,t.y,Math.max(6,t.r1),Math.max(6,t.r2),t.a,0,Math.PI*2); octx.stroke(); } else { octx.beginPath(); octx.arc(t.x,t.y,Math.max(6,t.r1),0,Math.PI*2); octx.stroke(); } octx.beginPath(); octx.arc(t.x,t.y,4,0,Math.PI*2); octx.fill(); }
+  octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; const now=performance.now(); let okCount=0; for(const t of tracker.tracks){ const ok = LIVE_MODE ? ((now - (t.seen||0)) < LIVE_DROP_MS) : ((t.lockedUntil && now<t.lockedUntil) || (t.okSince && now<(t.okHoldUntil||0))); if(ok) okCount++; octx.strokeStyle= ok? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)'; octx.fillStyle= ok? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)'; if(t.type==='ellipse' && Math.abs(t.r1-t.r2)>1){ octx.beginPath(); octx.ellipse(t.x,t.y,Math.max(6,t.r1),Math.max(6,t.r2),t.a,0,Math.PI*2); octx.stroke(); } else { octx.beginPath(); octx.arc(t.x,t.y,Math.max(6,t.r1),0,Math.PI*2); octx.stroke(); } octx.beginPath(); octx.arc(t.x,t.y,4,0,Math.PI*2); octx.fill(); }
   countEl.textContent=String(okCount);
 
   // finalize if stable or deadline
-  (function(){ const elapsed=performance.now()-startTs; process._hist=process._hist||[]; process._hist.push(okCount); if(process._hist.length>STABLE_WIN) process._hist.shift(); const min=Math.min(...process._hist), max=Math.max(...process._hist); if(!frozen && ((process._hist.length>=STABLE_WIN && (max-min)<=STABLE_TOL && elapsed>1200) || elapsed>=DEADLINE_MS)){ freezeNow(Math.round(median(process._hist))); } })();
+  (function(){ const elapsed=performance.now()-startTs; process._hist=process._hist||[]; process._hist.push(okCount); if(process._hist.length>STABLE_WIN) process._hist.shift(); const min=Math.min(...process._hist), max=Math.max(...process._hist); if(!LIVE_MODE && !frozen && ((process._hist.length>=STABLE_WIN && (max-min)<=STABLE_TOL && elapsed>1200) || elapsed>=DEADLINE_MS)){ freezeNow(Math.round(median(process._hist))); } })();
 
   finalMask.delete(); updateFps(); frameIdx++;
 }catch(e){ console.error(e); showErr(e?.message||String(e)); }
@@ -336,7 +340,7 @@ function softRefreshDetection(){
 function lockFeedSize(){ const feed=document.querySelector('.feed'); if(!feed) return; const rect=feed.getBoundingClientRect(); const h=rect.height||video.getBoundingClientRect().height||0; feed.style.setProperty('--locked-h', `${Math.round(h)}px`); feed.classList.add('lock'); }
 function unlockFeedSize(){ const feed=document.querySelector('.feed'); if(!feed) return; feed.classList.remove('lock'); feed.style.removeProperty('--locked-h'); }
 
-function startAutoRefresh(){ try{ clearInterval(autoRefreshTimer); }catch{} autoRefreshTimer=setInterval(()=>{ if(running&&stream){ softRefreshDetection(); } }, DETECTION_REFRESH_MS); }
+function startAutoRefresh(){ try{ clearInterval(autoRefreshTimer); }catch{} if(LIVE_MODE) return; autoRefreshTimer=setInterval(()=>{ if(running&&stream){ softRefreshDetection(); } }, DETECTION_REFRESH_MS); }
 
 startBtn.addEventListener('click', async()=>{
   startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { if(!errEl.textContent) showErr('Could not start the camera. Check HTTPS and browser site settings.'); } startBtn.disabled=false; });
@@ -368,7 +372,7 @@ async function refreshCamera(){
   }
   startBtn.disabled=false;
 }
-recountBtn.addEventListener('click', refreshCamera);
+recountBtn.addEventListener('click', softRefreshDetection);
 
 window.addEventListener('beforeunload', ()=>{
   try{ stream && stream.getTracks().forEach(t=>t.stop()); }catch{}
@@ -383,4 +387,3 @@ window.addEventListener('beforeunload', ()=>{
 </script>
 </body>
 </html>
-
