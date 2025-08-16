@@ -30,6 +30,10 @@
     input[type=range]{ -webkit-appearance:none; appearance:none; width:180px; height:6px; border-radius:999px; background:#d9eaff; outline:none }
     input[type=range]::-webkit-slider-thumb{ -webkit-appearance:none; appearance:none; width:18px; height:18px; border-radius:50%; background:var(--primary); cursor:pointer }
     input[type=range]::-moz-range-thumb{ width:18px; height:18px; border-radius:50%; background:var(--primary); cursor:pointer }
+      /* Keep feed size stable during camera restart (iOS Safari) */
+    .feed.lock{ height:var(--locked-h, auto); }
+    .feed.lock video,
+    .feed.lock #overlay{ width:100%; height:100%; object-fit:contain; }
   </style>
 </head>
 <body>
@@ -86,6 +90,10 @@ let frameIdx=0;
 let startTs=0, frozen=false;
 const DEADLINE_MS=5000, STABLE_WIN=8, STABLE_TOL=1; // finalization
 const COUNT_FREEZE_MS=10000; // hold final number
+
+// Auto refresh interval: soft detection reset every 20s
+const DETECTION_REFRESH_MS=20000;
+let autoRefreshTimer=null;
 
 // processing sizes
 const PROC_MAX_W=384; let procW=0,procH=0,vidW=0,vidH=0,sX=1,sY=1;
@@ -285,8 +293,24 @@ function process(){ if(!running) return; try{
 
 window.cv=window.cv||{}; cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
 
+// Soft refresh: reset detection without restarting camera (keeps size stable)
+function softRefreshDetection(){
+  frozen=false; running=true; startTs=performance.now();
+  process._hist=[]; frameIdx=0; countEl.textContent='0';
+  tracker.tracks=[]; tracker.nextId=1; sizePrior.R=null;
+  try{ cache.grad&&cache.grad.delete(); cache.grad=null; cache.gradBin&&cache.gradBin.delete(); cache.gradBin=null; cache.dtMask&&cache.dtMask.delete(); cache.dtMask=null; cache.labMask&&cache.labMask.delete(); cache.labMask=null; cache.lcMask&&cache.lcMask.delete(); cache.lcMask=null; cache.glare&&cache.glare.delete(); cache.glare=null; }catch{}
+  try{ mem.cells&&mem.cells.fill(0); }catch{}
+  requestAnimationFrame(process);
+}
+
+// Lock/unlock feed size to avoid shrink-jump during camera restarts on iPhone
+function lockFeedSize(){ const feed=document.querySelector('.feed'); if(!feed) return; const rect=feed.getBoundingClientRect(); const h=rect.height||video.getBoundingClientRect().height||0; feed.style.setProperty('--locked-h', `${Math.round(h)}px`); feed.classList.add('lock'); }
+function unlockFeedSize(){ const feed=document.querySelector('.feed'); if(!feed) return; feed.classList.remove('lock'); feed.style.removeProperty('--locked-h'); }
+
+function startAutoRefresh(){ try{ clearInterval(autoRefreshTimer); }catch{} autoRefreshTimer=setInterval(()=>{ if(running&&stream){ softRefreshDetection(); } }, DETECTION_REFRESH_MS); }
+
 startBtn.addEventListener('click', async()=>{
-  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { showErr('Could not start the camera.'); } startBtn.disabled=false; });
+  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { showErr('Could not start the camera.'); } startBtn.disabled=false; });
 window.addEventListener('resize', ()=>{ if(video.videoWidth) syncBuffers(); });
 
 // Brightness slider -> try hardware exposure first; fallback to software "beta"
@@ -300,10 +324,19 @@ brightEl.addEventListener('input', ()=>{
 });
 
 function resetAll(){ tracker.tracks=[]; tracker.nextId=1; sizePrior.R=null; frameIdx=0; process._hist=[]; octx.clearRect(0,0,overlay.width,overlay.height); countEl.textContent='…'; try{ cache.grad&&cache.grad.delete(); cache.grad=null; cache.gradBin&&cache.gradBin.delete(); cache.gradBin=null; cache.dtMask&&cache.dtMask.delete(); cache.dtMask=null; cache.labMask&&cache.labMask.delete(); cache.labMask=null; cache.lcMask&&cache.lcMask.delete(); cache.lcMask=null; cache.glare&&cache.glare.delete(); cache.glare=null; }catch{} mem.cells&&mem.cells.fill(0); }
-async function refreshCamera(){ running=false; frozen=false; try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch{} stream=null; resetAll(); startBtn.disabled=true; const ok=await startCamera(); if(ok){ syncBuffers(); running=true; frozen=false; startTs=performance.now(); requestAnimationFrame(process); } startBtn.disabled=false; }
+async function refreshCamera(){
+  lockFeedSize();
+  running=false; frozen=false;
+  try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch{}
+  stream=null; resetAll(); startBtn.disabled=true;
+  const ok=await startCamera();
+  if(ok){ syncBuffers(); running=true; frozen=false; startTs=performance.now(); requestAnimationFrame(process); startAutoRefresh(); setTimeout(unlockFeedSize, 300); }
+  else { unlockFeedSize(); }
+  startBtn.disabled=false;
+} }catch{} stream=null; resetAll(); startBtn.disabled=true; const ok=await startCamera(); if(ok){ syncBuffers(); running=true; frozen=false; startTs=performance.now(); requestAnimationFrame(process); } startBtn.disabled=false; }
 recountBtn.addEventListener('click', refreshCamera);
 
-window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.grad.delete(); cache.dtMask&&cache.dtMask.delete(); });
+window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); try{ cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); }catch{} try{ clearInterval(autoRefreshTimer);}catch{} }); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.grad.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
 </body>
 </html>
