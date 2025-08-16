@@ -653,9 +653,17 @@ function resetAll(){
   }catch{}
   mem.cells&&mem.cells.fill(0);
 }
-async function refreshCamera(){
-  running=false; frozen=false; lastRefocusTs = performance.now();
-  try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch(e){}
+$1
+function refreshDetection(){
+  if(!stream) return;
+  resetAll();
+  frozen=false;
+  if(!running){
+    running=true;
+    requestAnimationFrame(process);
+  }
+  startTs=performance.now();
+}
   stream=null; resetAll();
   startBtn.disabled=true;
   const ok = await startCamera();
@@ -700,11 +708,9 @@ recountBtn.addEventListener('click', async ()=>{
   overlay.style.height = '100%';
   if(feed) feed.style.height = '';
 });
-  });
-});
 
-// Auto-refresh pill count every 20 seconds by triggering a recount
-setInterval(()=>{ try{ if(running && stream){ recountBtn.click(); } }catch{} }, 20000);
+// Auto-refresh detection every 20 seconds without resetting camera
+setInterval(()=>{ try{ if(running && stream){ refreshDetection(); } }catch{} }, 20000);
 
 window.addEventListener('beforeunload', ()=>{
   try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{};
