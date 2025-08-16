@@ -135,22 +135,45 @@ function odd(n){ return (n%2)?n:n+1; }
 function median(a){ const b=[...a].sort((x,y)=>x-y), m=Math.floor(b.length/2); return b.length%2?b[m]:(b[m-1]+b[m])/2; }
 
 async function startCamera(){
+  // Detect sandboxed/embedded previews that block camera (e.g., iframe without permissions)
+  try{
+    const inFrame = (window.top !== window.self);
+    const pol = (document.featurePolicy || document.permissionsPolicy);
+    let camAllowed = true;
+    if(pol && typeof pol.allowsFeature === 'function'){
+      camAllowed = pol.allowsFeature('camera');
+    }
+    if(inFrame && camAllowed === false){
+      showErr('Camera is blocked in this embedded preview. Open this file in its own tab or serve it over HTTPS/localhost.');
+      return false;
+    }
+  }catch{}
+
   errEl.textContent='';
+  // Preflight: require camera API + secure context
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    showErr('Camera not supported in this browser. Use Safari/Chrome over HTTPS.');
+    return false;
+  }
+  if(location.protocol!=='https:' && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
+    showErr('This page must be served over HTTPS or localhost for the camera to work.');
+  }
   const tries=[
     {video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}}, audio:false},
     {video:{facingMode:{ideal:'environment'}, width:{ideal:960}, height:{ideal:540}}, audio:false},
     {video:true, audio:false}
   ];
   try{ const devs=await navigator.mediaDevices.enumerateDevices(); const back=devs.find(d=>d.kind==='videoinput' && /back|environment/i.test(d.label||'')); if(back) tries.unshift({video:{deviceId:{exact:back.deviceId}, width:{ideal:1280}, height:{ideal:720}}, audio:false}); }catch{}
+  let lastErr=null;
   for(const c of tries){
     try{
       stream=await navigator.mediaDevices.getUserMedia(c);
-      video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play();
+      video.srcObject=stream; video.setAttribute('playsinline','true'); video.playsInline=true; video.muted=true; await video.play().catch(()=>{});
       try{ const track=stream.getVideoTracks()[0]; const caps=track.getCapabilities?track.getCapabilities():{}; const adv=[]; if(caps.exposureMode)adv.push({exposureMode:'continuous'}); if(caps.whiteBalanceMode)adv.push({whiteBalanceMode:'continuous'}); if(caps.focusMode)adv.push({focusMode:'continuous'}); if(caps.exposureCompensation)adv.push({exposureCompensation:caps.exposureCompensation.max}); if(caps.torch)adv.push({torch:true}); if(adv.length) track.applyConstraints({advanced:adv}).catch(()=>{});}catch{}
       return true;
-    }catch(e){ console.warn('gUM fail',c,e); }
+    }catch(e){ console.warn('gUM fail',c,e); lastErr=e; }
   }
-  showErr('Could not start the camera. Use HTTPS or localhost.');
+  showErr('Could not start the camera. '+ (lastErr? (lastErr.name+(lastErr.message?(': '+lastErr.message):'')) : 'Use HTTPS or localhost.'));
   return false;
 }
 
