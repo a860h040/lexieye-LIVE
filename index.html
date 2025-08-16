@@ -270,7 +270,7 @@ function process(){ if(!running) return; try{
     if(roundOK){ const M=cv.moments(cnt); const cxp=M.m10/(M.m00||1), cyp=M.m01/(M.m00||1); const rp=Math.max(6,Math.sqrt(area/Math.PI)); edgeOK=ringEdgeOK(cxp,cyp,rp); contrastOK=regionContrastOK(cxp,cyp,rp); }
     else if(capsuleOK && isEllipse){ const rr=Math.max(er1,er2); contrastOK=regionContrastOK(ex,ey,rr); }
     strong=((edgeOK||contrastOK) && brightOK && solid>0.82 && circ>0.60);
-    if(coverOK && ((roundOK && (edgeOK||contrastOK) && brightOK) || (capsuleOK && contrastOK && brightOK))){ if(roundOK){ const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6,Math.sqrt(area/Math.PI)); const Rv=r*Math.sqrt((sX+sY)/2); dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:circ*solid,strong}); eqR.push(Rv);} else { const Rv=Math.max(er1*sX, er2*sY); dets.push({type:'ellipse',x:offsetX+ex*sX,y:offsetY+ey*sY,r1:er1*sX,r2:er2*sY,a:eang,score:solid,strong:false}); eqR.push(Rv);} }
+    if(coverOK && ((roundOK && (edgeOK||contrastOK) && brightOK) || (capsuleOK && contrastOK && brightOK))){ if(roundOK){ const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6,Math.sqrt(area/Math.PI)); const Rv=r*Math.sqrt((sX+sY)/2); dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:circ*solid,strong}); eqR.push(Rv);} else { const Rv=Math.max(er1*sX,er2*sY); dets.push({type:'ellipse',x:ex*sX,y:ey*sY,r1:er1*sX,r2:er2*sY,a:eang,score:solid,strong:false}); eqR.push(Rv);} }
     hull.delete(); cnt.delete();
   }
 
