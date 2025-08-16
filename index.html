@@ -11,20 +11,20 @@
     body{font-family:Poppins,system-ui,Segoe UI,Arial,sans-serif;background:radial-gradient(circle at 40% 40%,var(--bg),#e0f4ff);color:var(--text);margin:0;padding:20px}
     h1{ text-align:center; font-size:2.2rem; color:var(--primary); margin:0 0 12px }
     .wrap{ max-width:1000px; margin:auto; border-radius:24px; padding:16px; background:var(--glass); border:1px solid var(--border-glass); backdrop-filter:blur(20px) }
-    .controls{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; position:relative; z-index:10 }
+    .controls{ display:flex; gap:10px; align-items:center; flex-wrap:wrap }
     .controls .spacer{ flex:1 }
     .btn{ background:var(--primary); color:#fff; border:none; border-radius:16px; padding:10px 14px; cursor:pointer }
     .btn[disabled]{ opacity:.6; cursor:not-allowed }
     .pill{ display:inline-block; padding:4px 10px; border-radius:12px; background:#e8f4ff; border:1px solid #cfe7ff; font-size:1.1rem }
     .err{ color:#b00020; font-size:.95rem; min-height:1.2em }
 
-    .feed{ position:relative; width:100%; max-width:960px; margin-top:10px; overflow:hidden; aspect-ratio: 4/3; z-index:1 }
-    video{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:block; border-radius:18px; border:2px solid var(--primary) }
-    #overlay{ position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; border-radius:18px; z-index:1 }
+    .feed{ position:relative; width:100%; max-width:960px; margin-top:10px }
+    video{ display:block; width:100%; height:auto; border-radius:18px; border:2px solid var(--primary) }
+    #overlay{ position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; border-radius:18px }
     #count{ font-size:clamp(3rem,12vw,10rem); font-weight:800; line-height:1; font-variant-numeric:tabular-nums; letter-spacing:.02em }
     #fps{ font-size:1rem }
 
-    /* sliders */
+    /* slider */
     .slider-wrap{ display:flex; align-items:center; gap:10px; background:#eef7ff; border:1px solid #cfe7ff; padding:6px 10px; border-radius:14px }
     .slider-wrap label{ font-weight:600; font-size:.95rem }
     input[type=range]{ -webkit-appearance:none; appearance:none; width:180px; height:6px; border-radius:999px; background:#d9eaff; outline:none }
@@ -36,42 +36,41 @@
   <h1>LexiEye</h1>
   <div class="wrap">
     <div class="controls">
-      <!-- Camera button on the left -->
+      <!-- Keep camera button on the left -->
       <button id="startBtn" class="btn">Enable Camera & Start</button>
 
       <div class="spacer"></div>
 
-      <!-- Brightness/exposure slider -->
+      <!-- On‑device brightness/exposure slider -->
       <div class="slider-wrap">
         <label for="bright">Brightness</label>
+        <!-- widen range and show percentage -->
         <input id="bright" type="range" min="-100" max="100" step="1" value="0" />
         <span class="pill" id="brightVal">0</span>
-      </div>
-
-      <!-- Zoom slider -->
-      <div class="slider-wrap">
-        <label for="zoom">Zoom</label>
-        <input id="zoom" type="range" min="100" max="300" step="1" value="100" />
-        <span class="pill" id="zoomVal">100%</span>
       </div>
 
       <span class="pill"><b id="count">0</b></span>
       <span class="pill" id="fps">0 fps</span>
 
-      <!-- Recount on the right -->
+      <!-- Keep recount on the right -->
       <button id="recountBtn" class="btn">Recount Final</button>
     </div>
-
     <div class="err" id="err"></div>
-
     <div class="feed">
-      <video id="video" autoplay playsinline webkit-playsinline muted></video>
+      <video id="video" autoplay playsinline muted></video>
       <canvas id="overlay"></canvas>
     </div>
   </div>
 
 <script>
-// === LexiEye — robust real-time pill counter (focus UI removed) ===
+// === LexiEye — robust real‑time pill counter ===
+// • Any shape (round/oval/capsule) with dynamic brightness & glare handling
+// • Auto polarity (Binary/BinaryInv) for Otsu so dark or light backgrounds work
+// • 10s lock per pill, +2s minimum stick so green doesn't drop
+// • Final number freezes once stable ≤1 for ~8 frames or after 5s deadline
+// • Recount Final restarts camera + pipeline
+// • NEW: User brightness slider — tries hardware exposure; otherwise boosts/dims in software.
+
 const startBtn=document.getElementById('startBtn');
 const recountBtn=document.getElementById('recountBtn');
 const errEl=document.getElementById('err');
@@ -82,49 +81,38 @@ const countEl=document.getElementById('count');
 const fpsEl=document.getElementById('fps');
 const brightEl=document.getElementById('bright');
 const brightVal=document.getElementById('brightVal');
-const zoomEl=document.getElementById('zoom');
-const zoomVal=document.getElementById('zoomVal');
 
 let stream=null, running=false, lastTick=performance.now(), frames=0;
-// zoom/crop state
-let softZoom=1, useSoftZoom=true, cropX=0, cropY=0, cropW=0, cropH=0, offsetX=0, offsetY=0;
 let frameIdx=0;
 let startTs=0, frozen=false;
-const DEADLINE_MS=5000, STABLE_WIN=8, STABLE_TOL=1;
-const COUNT_FREEZE_MS=10000;
+const DEADLINE_MS=5000, STABLE_WIN=8, STABLE_TOL=1; // finalization
+const COUNT_FREEZE_MS=10000; // hold final number
 
 // processing sizes
 const PROC_MAX_W=384; let procW=0,procH=0,vidW=0,vidH=0,sX=1,sY=1;
 
-// throttles
+// throttles (bigger = less often)
 const PERF={DT_EVERY:2,GRAD_EVERY:2,HOUGH_EVERY:3,CLAHE_EVERY:3};
 
 // locks
 const LOCK_MS=10000, MIN_LOCK_MS=2000, DELETE_BASE_MS=6000, LOCK_HALO_SCALE=1.25, LOCK_HALO_PAD=8;
 
-// memory grid
+// memory grid (helps re‑confirm dropped pills)
 const MEM_CELL=10, MEM_DECAY=0.94, MEM_HIT=1.0, MEM_HIT_NEI=0.5, MEM_SPAWN=3.0;
 
 // edge ring test
 const EDGE_RING_MIN_PX=2, EDGE_RING_THICK=0.22, EDGE_MIN_COVER=0.15, EDGE_BIN_BIAS=2;
 
-// === Auto re-focus / auto-refresh ===
-let hasFocusSupport = false, hasFocusDistance = false, focusRange = null, hasPOI = false, hasZoom = false;
-let lastRefocusTs = 0;
-let refocusTries = 0;
-let sharpEMA = null;
-const SHARP_SAMPLING = 10;        // check sharpness every N frames
-const SHARP_TARGET = 85;          // Laplacian variance target (~higher = sharper)
-const SHARP_EMA_ALPHA = 0.2;      // smoothing for stability
-const REFOCUS_COOLDOWN_MS = 2500; // min time between refocus attempts
-const MAX_REFOCUS_TRIES = 2;
-const KICK_REFOCUS_DELAY_MS = 300;      // then auto-refresh camera
+// User brightness. Range [-100..100], applied three ways:
+//  (A) Try camera exposureCompensation (hardware)
+//  (B) CSS preview filter so you see it live
+//  (C) Processing gamma LUT + alpha/beta so detection really changes
+let userBright = 0;            // slider value
+let brightLUT = null;          // cv.Mat 1x256 for gamma
 
-// Brightness control
-let userBright = 0;
-let brightLUT = null;
 function buildBrightLUT(val){
-  const gamma = Math.max(0.2, Math.min(3.0, Math.pow(2, -val/50)));
+  // Map slider to gamma curve (positive -> brighten => gamma < 1)
+  const gamma = Math.max(0.2, Math.min(3.0, Math.pow(2, -val/50))); // [-100..100] → ~[3..0.25]
   const lut = new cv.Mat(1,256,cv.CV_8UC1);
   for(let i=0;i<256;i++){
     const v = Math.round(255 * Math.pow(i/255, gamma));
@@ -162,31 +150,12 @@ async function startCamera(){
     {video:{facingMode:{ideal:'environment'}, width:{ideal:960}, height:{ideal:540}}, audio:false},
     {video:true, audio:false}
   ];
-  try{
-    const devs=await navigator.mediaDevices.enumerateDevices();
-    const back=devs.find(d=>d.kind==='videoinput' && /back|environment/i.test(d.label||''));
-    if(back) tries.unshift({video:{deviceId:{exact:back.deviceId}, width:{ideal:1280}, height:{ideal:720}}, audio:false});
-  }catch{}
+  try{ const devs=await navigator.mediaDevices.enumerateDevices(); const back=devs.find(d=>d.kind==='videoinput' && /back|environment/i.test(d.label||'')); if(back) tries.unshift({video:{deviceId:{exact:back.deviceId}, width:{ideal:1280}, height:{ideal:720}}, audio:false}); }catch{}
   for(const c of tries){
     try{
       stream=await navigator.mediaDevices.getUserMedia(c);
       video.srcObject=stream; video.setAttribute('playsinline','true'); await video.play();
-      try{
-        const track=stream.getVideoTracks()[0];
-        const caps=track.getCapabilities?track.getCapabilities():{};
-        hasFocusSupport = !!(caps && (caps.focusMode || caps.focusDistance));
-        hasFocusDistance = !!(caps && caps.focusDistance);
-        focusRange = hasFocusDistance ? { min: caps.focusDistance.min, max: caps.focusDistance.max } : null;
-        hasPOI = !!(caps && caps.pointsOfInterest);
-        hasZoom = !!(caps && caps.zoom);
-        hasFocusSupport = !!(caps && (caps.focusMode || caps.focusDistance));
-        const adv=[]; if(caps.focusMode)adv.push({focusMode:'continuous'});
-        if(caps.exposureMode)adv.push({exposureMode:'continuous'});
-        if(caps.whiteBalanceMode)adv.push({whiteBalanceMode:'continuous'});
-        if(caps.exposureCompensation)adv.push({exposureCompensation:caps.exposureCompensation.max});
-        if(caps.torch)adv.push({torch:true});
-        if(adv.length) track.applyConstraints({advanced:adv}).catch(()=>{});
-      }catch{}
+      try{ const track=stream.getVideoTracks()[0]; const caps=track.getCapabilities?track.getCapabilities():{}; const adv=[]; if(caps.exposureMode)adv.push({exposureMode:'continuous'}); if(caps.whiteBalanceMode)adv.push({whiteBalanceMode:'continuous'}); if(caps.focusMode)adv.push({focusMode:'continuous'}); if(caps.exposureCompensation)adv.push({exposureCompensation:caps.exposureCompensation.max}); if(caps.torch)adv.push({torch:true}); if(adv.length) track.applyConstraints({advanced:adv}).catch(()=>{});}catch{}
       return true;
     }catch(e){ console.warn('gUM fail',c,e); }
   }
@@ -196,27 +165,12 @@ async function startCamera(){
 
 function syncBuffers(){
   vidW=video.videoWidth||640; vidH=video.videoHeight||480;
-  const dpr = window.devicePixelRatio || 1;
-overlay.width = Math.round(vidW * dpr);
-overlay.height = Math.round(vidH * dpr); overlay.style.width='100%'; overlay.style.height='100%';
-  video.style.width='100%'; video.style.height='100%';
-// Match drawing coordinates to Retina/HiDPI so circles align on iPhone
-try{ octx.setTransform(overlay.width/vidW, 0, 0, overlay.height/vidH, 0, 0); }catch{}
-
-  updateCrop();
-
-  procW=Math.min(cropW,PROC_MAX_W); procH=Math.round(cropH*(procW/cropW));
-  work.width=procW; work.height=procH; sX=cropW/procW; sY=cropH/procH;
-
+  overlay.width=vidW; overlay.height=vidH; overlay.style.width=vidW+'px'; overlay.style.height=vidH+'px'; video.style.width=vidW+'px';
+  procW=Math.min(vidW,PROC_MAX_W); procH=Math.round(vidH*(procW/vidW)); work.width=procW; work.height=procH; sX=vidW/procW; sY=vidH/procH;
   [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}});
-  src=new cv.Mat(procH,procW,cv.CV_8UC4); rgb=new cv.Mat(procH,procW,cv.CV_8UC3); hsv=new cv.Mat(procH,procW,cv.CV_8UC3);
-  gray=new cv.Mat(procH,procW,cv.CV_8UC1); blur=new cv.Mat(procH,procW,cv.CV_8UC1); mask=new cv.Mat(procH,procW,cv.CV_8UC1);
-  adaptive=new cv.Mat(procH,procW,cv.CV_8UC1); hsvMask=new cv.Mat(procH,procW,cv.CV_8UC1); fused=new cv.Mat(procH,procW,cv.CV_8UC1);
-  dt=new cv.Mat(procH,procW,cv.CV_32F); glareMask=new cv.Mat(procH,procW,cv.CV_8UC1); contours=new cv.MatVector(); hierarchy=new cv.Mat();
-  const ks=odd(Math.max(3,Math.round(Math.min(procW,procH)*0.02)));
-  const kb=odd(Math.max(9,Math.round(Math.min(procW,procH)*0.07)));
-  kSmall=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(ks,ks));
-  kBig=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(kb,kb));
+  src=new cv.Mat(procH,procW,cv.CV_8UC4); rgb=new cv.Mat(procH,procW,cv.CV_8UC3); hsv=new cv.Mat(procH,procW,cv.CV_8UC3); gray=new cv.Mat(procH,procW,cv.CV_8UC1); blur=new cv.Mat(procH,procW,cv.CV_8UC1); mask=new cv.Mat(procH,procW,cv.CV_8UC1); adaptive=new cv.Mat(procH,procW,cv.CV_8UC1); hsvMask=new cv.Mat(procH,procW,cv.CV_8UC1); fused=new cv.Mat(procH,procW,cv.CV_8UC1); dt=new cv.Mat(procH,procW,cv.CV_32F); glareMask=new cv.Mat(procH,procW,cv.CV_8UC1); contours=new cv.MatVector(); hierarchy=new cv.Mat();
+  const ks=odd(Math.max(3,Math.round(Math.min(procW,procH)*0.02))); const kb=odd(Math.max(9,Math.round(Math.min(procW,procH)*0.07)));
+  kSmall=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(ks,ks)); kBig=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(kb,kb));
   try{ clahe=cv.createCLAHE(2.0,new cv.Size(8,8)); }catch{}
   initMemory();
 }
@@ -243,99 +197,7 @@ function buildGradients(){ if((frameIdx%PERF.GRAD_EVERY)===0 || !cache.grad){ so
 function ringEdgeOK(cx,cy,r){ if(glareMask){ const py=Math.max(0,Math.min(procH-1,Math.round(cy))); const px=Math.max(0,Math.min(procW-1,Math.round(cx))); try{ if(glareMask.ucharPtr(py,px)[0]>0) return false; }catch{} }
   const R=Math.max(3,Math.round(r)); const t=Math.max(EDGE_RING_MIN_PX,Math.round(R*EDGE_RING_THICK)); const x0=Math.max(0,Math.round(cx-R-t)); const y0=Math.max(0,Math.round(cy-R-t)); const w=Math.min(procW-x0,2*(R+t)+1); const h=Math.min(procH-y0,2*(R+t)+1); const cxr=Math.round(R+t), cyr=cxr; const ring=cv.Mat.zeros(h,w,cv.CV_8UC1), inner=cv.Mat.zeros(h,w,cv.CV_8UC1); cv.circle(ring,new cv.Point(cxr,cyr),R+t,new cv.Scalar(255,255,255,255),-1); cv.circle(inner,new cv.Point(cxr,cyr),Math.max(1,R-t),new cv.Scalar(255,255,255,255),-1); cv.subtract(ring,inner,ring); const gROI=gradBin.roi(new cv.Rect(x0,y0,w,h)); const inter=new cv.Mat(); cv.bitwise_and(gROI,ring,inter); const c1=cv.countNonZero(inter), c0=cv.countNonZero(ring); ring.delete(); inner.delete(); inter.delete(); gROI.delete(); return (c1/Math.max(1,c0))>EDGE_MIN_COVER; }
 
-function regionContrastOK(cx,cy,r){ const R=Math.max(4,Math.round(r)); const t=Math.max(2,Math.round(R*0.25)); const x0=Math.max(0,Math.round(cx-R-t-2)); const y0=Math.max(0,Math.round(cy-R-t-2)); const w = Math.min(procW - x0, 2*(R+t) + 5); const h = Math.min(procH - y0, 2*(R+t) + 5); const cxr=Math.round((cx-x0)), cyr=Math.round((cy-y0)); const inner=cv.Mat.zeros(h,w,cv.CV_8UC1), outer=cv.Mat.zeros(h,w,cv.CV_8UC1); cv.circle(inner,new cv.Point(cxr,cyr),Math.max(2,R-1),new cv.Scalar(255,255,255,255),-1); cv.circle(outer,new cv.Point(cxr,cyr),R+t,new cv.Scalar(255,255,255,255),-1); const ring=new cv.Mat(); cv.subtract(outer,inner,ring); const gROI=gray.roi(new cv.Rect(x0,y0,w,h)); const mIn=new cv.Mat(), sIn=new cv.Mat(); cv.meanStdDev(gROI,mIn,sIn,inner); const mOut=new cv.Mat(), sOut=new cv.Mat(); cv.meanStdDev(gROI,mOut,sOut,ring); const meanIn=mIn.doubleAt(0,0), stdIn=sIn.doubleAt(0,0); const meanOut=mOut.doubleAt(0,0), stdOut=sOut.doubleAt(0,0); inner.delete(); outer.delete(); ring.delete(); gROI.delete(); mIn.delete(); sIn.delete(); mOut.delete(); sOut.delete(); const noise=stdOut; const minGap=Math.max(5,1.6*noise); const maxStdIn=Math.max(50,1.0*noise+24); return (meanIn-meanOut)>=minGap && stdIn<maxStdIn; }
-
-// --- Sharpness measurement (Laplacian variance) ---
-function measureSharpness(srcGray){
-  try {
-    const scale = Math.max(2, Math.round(Math.min(procW||160, procH||120)/160));
-    const w = Math.max(80, Math.round((procW||160)/scale));
-    const h = Math.max(80, Math.round((procH||120)/scale));
-    const small = new cv.Mat();
-    cv.resize(srcGray, small, new cv.Size(w,h), 0, 0, cv.INTER_AREA);
-    const lap = new cv.Mat();
-    cv.Laplacian(small, lap, cv.CV_16S, 3);
-    const abs = new cv.Mat();
-    cv.convertScaleAbs(lap, abs);
-    const m = new cv.Mat(); const s = new cv.Mat();
-    cv.meanStdDev(abs, m, s);
-    const variance = s.doubleAt(0,0) * s.doubleAt(0,0);
-    small.delete(); lap.delete(); abs.delete(); m.delete(); s.delete();
-    return variance;
-  } catch { return 0; }
-}
-
-function advancedHardwareRefocus(){
-  return new Promise(async (resolve)=>{
-    try {
-      if(!stream){ resolve(false); return; }
-      const track = stream.getVideoTracks()[0];
-      const caps = track.getCapabilities ? track.getCapabilities() : {};
-      if (caps && caps.focusMode) {
-        // Prefer single-shot if available, else fall back to continuous
-        try { await track.applyConstraints({ advanced:[{ focusMode:'single-shot' }] }); resolve(true); return; } catch {}
-        try { await track.applyConstraints({ advanced:[{ focusMode:'continuous' }] }); resolve(true); return; } catch {}
-      }
-    } catch {}
-    resolve(false);
-  });
-}
-function maybeAutoRefocus(sharp){
-  const now = performance.now();
-  if (sharpEMA==null) sharpEMA = sharp;
-  sharpEMA = SHARP_EMA_ALPHA*sharp + (1-SHARP_EMA_ALPHA)*sharpEMA;
-  if (!hasFocusSupport) {
-    // If no HW focus support, occasionally refresh when persistently blurry
-    if ((frameIdx % SHARP_SAMPLING)===0 && now - lastRefocusTs > REFOCUS_COOLDOWN_MS && sharpEMA < SHARP_TARGET){
-      lastRefocusTs = now; refocusTries++;
-      if (refocusTries >= MAX_REFOCUS_TRIES) { refocusTries = 0; refreshCamera(); }
-    }
-    return;
-  }
-  if ((frameIdx % SHARP_SAMPLING)!==0) return;
-  if (now - lastRefocusTs < REFOCUS_COOLDOWN_MS) return;
-  if (sharpEMA < SHARP_TARGET) {
-    lastRefocusTs = now;
-    advancedHardwareRefocus().then(ok=>{
-      if(!ok){ refocusTries++; if(refocusTries>=MAX_REFOCUS_TRIES){ refocusTries=0; refreshCamera(); } }
-      else { refocusTries = 0; }
-    });
-  }
-}
-
-function kickRefocus(){ try{ lastRefocusTs = 0; refocusTries = 0; setTimeout(()=>{ advancedHardwareRefocus(); }, KICK_REFOCUS_DELAY_MS); }catch{} }
-
-function advancedHardwareRefocus(){
-  return new Promise(async (resolve)=>{
-    try {
-      if(!stream){ resolve(false); return; }
-      const track = stream.getVideoTracks()[0];
-      const caps  = track.getCapabilities ? track.getCapabilities() : {};
-      let ok = false;
-      if (caps && caps.focusMode) {
-        try { await track.applyConstraints({ advanced:[{ focusMode:'continuous' }] }); ok = true; } catch {}
-        try { await track.applyConstraints({ advanced:[{ focusMode:'single-shot' }] }); ok = true; } catch {}
-        try { await track.applyConstraints({ advanced:[{ focusMode:'continuous' }] }); ok = true; } catch {}
-      }
-      if (caps && caps.pointsOfInterest) {
-        try { await track.applyConstraints({ advanced:[{ pointsOfInterest: [{ x:0.5, y:0.5 }] }] }); ok = true; } catch {}
-      }
-      if (caps && caps.zoom) {
-        try {
-          const s = track.getSettings ? track.getSettings() : {};
-          const cur = s.zoom ?? caps.zoom.min ?? 1;
-          const delta = Math.max( (caps.zoom.max - (caps.zoom.min||0)) * 0.02, 0.05 );
-          const up = Math.min(cur + delta, caps.zoom.max || cur+delta);
-          await track.applyConstraints({ advanced:[{ zoom: up }] });
-          await new Promise(r=>setTimeout(r,120));
-          await track.applyConstraints({ advanced:[{ zoom: cur }] });
-          ok = true;
-        } catch {}
-      }
-      resolve(!!ok);
-    } catch { resolve(false); }
-  });
-}
+function regionContrastOK(cx,cy,r){ const R=Math.max(4,Math.round(r)); const t=Math.max(2,Math.round(R*0.25)); const x0=Math.max(0,Math.round(cx-R-t-2)); const y0=Math.max(0,Math.round(cy-R-t-2)); const w=Math.min(procW-x0,2*(R+t)+5); const h=Math.min(procH-y0,2*(R+t)+5); const cxr=Math.round((cx-x0)), cyr=Math.round((cy-y0)); const inner=cv.Mat.zeros(h,w,cv.CV_8UC1), outer=cv.Mat.zeros(h,w,cv.CV_8UC1); cv.circle(inner,new cv.Point(cxr,cyr),Math.max(2,R-1),new cv.Scalar(255,255,255,255),-1); cv.circle(outer,new cv.Point(cxr,cyr),R+t,new cv.Scalar(255,255,255,255),-1); const ring=new cv.Mat(); cv.subtract(outer,inner,ring); const gROI=gray.roi(new cv.Rect(x0,y0,w,h)); const mIn=new cv.Mat(), sIn=new cv.Mat(); cv.meanStdDev(gROI,mIn,sIn,inner); const mOut=new cv.Mat(), sOut=new cv.Mat(); cv.meanStdDev(gROI,mOut,sOut,ring); const meanIn=mIn.doubleAt(0,0), stdIn=sIn.doubleAt(0,0); const meanOut=mOut.doubleAt(0,0), stdOut=sOut.doubleAt(0,0); inner.delete(); outer.delete(); ring.delete(); gROI.delete(); mIn.delete(); sIn.delete(); mOut.delete(); sOut.delete(); const noise=stdOut; const minGap=Math.max(5,1.6*noise); const maxStdIn=Math.max(50,1.0*noise+24); return (meanIn-meanOut)>=minGap && stdIn<maxStdIn; }
 
 // tracker
 const tracker={tracks:[], nextId:1};
@@ -353,29 +215,13 @@ function process(){ if(!running) return; try{
   if(overlay.width!==video.videoWidth || work.width===0){ syncBuffers(); }
 
   // read frame
-  wctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, procW, procH);
-  if(src){ try{src.delete();}catch{} } src=cv.imread(work);
-  cv.cvtColor(src,rgb,cv.COLOR_RGBA2RGB);
-  cv.cvtColor(rgb,hsv,cv.COLOR_RGB2HSV);
-  cv.cvtColor(rgb,gray,cv.COLOR_RGB2GRAY);
-
-  // --- auto re-focus check (fast Laplacian sharpness) ---
-  if ((frameIdx % SHARP_SAMPLING) === 0) {
-    const sharp = measureSharpness(gray);
-    maybeAutoRefocus(sharp);
-  }
-
-  // illumination correction + CLAHE
+  wctx.drawImage(video,0,0,procW,procH); if(src){ try{src.delete();}catch{} } src=cv.imread(work); cv.cvtColor(src,rgb,cv.COLOR_RGBA2RGB); cv.cvtColor(rgb,hsv,cv.COLOR_RGB2HSV); cv.cvtColor(rgb,gray,cv.COLOR_RGB2GRAY);
   const opened=new cv.Mat(), closed=new cv.Mat(), tophat=new cv.Mat(), blackhat=new cv.Mat(), enh=new cv.Mat();
-  cv.morphologyEx(gray,opened,cv.MORPH_OPEN,kBig);
-  cv.morphologyEx(gray,closed,cv.MORPH_CLOSE,kBig);
-  cv.subtract(gray,opened,tophat);
-  cv.subtract(closed,gray,blackhat);
-  cv.add(gray,tophat,enh);
-  cv.subtract(enh,blackhat,enh);
+  cv.morphologyEx(gray,opened,cv.MORPH_OPEN,kBig); cv.morphologyEx(gray,closed,cv.MORPH_CLOSE,kBig);
+  cv.subtract(gray,opened,tophat); cv.subtract(closed,gray,blackhat); cv.add(gray,tophat,enh); cv.subtract(enh,blackhat,enh);
   if(clahe && (frameIdx%PERF.CLAHE_EVERY)===0){ try{ clahe.apply(enh,enh);}catch{} }
 
-  // software brightness
+  // **software brightness tweak** (gamma LUT + alpha/beta)
   if (brightLUT) { try{ cv.LUT(enh, brightLUT, enh); }catch{} }
   if (userBright!==0){
     const alpha = userBright>0 ? 1 + Math.min(0.8, userBright/120) : 1 + Math.max(-0.5, userBright/200);
@@ -388,15 +234,14 @@ function process(){ if(!running) return; try{
 
   buildGradients();
 
-  // fused mask
+  // === fused mask: (best Otsu ∧ Adaptive) ∨ HSV (when not sprinting)
   choosePolarityAndThreshold();
   const block=odd(Math.max(9,Math.round(Math.min(procW,procH)*0.06)));
   cv.adaptiveThreshold(blur,adaptive,255,cv.ADAPTIVE_THRESH_MEAN_C, thInvert?cv.THRESH_BINARY_INV:cv.THRESH_BINARY, block, 5);
   const both=new cv.Mat(); cv.bitwise_and(mask,adaptive,both);
   if(performance.now()-startTs<3000){ both.copyTo(fused); } else { hsvBrightMask(); cv.bitwise_or(both,hsvMask,fused); }
   both.delete();
-
-  // local contrast + glare cleanup
+  // local-contrast + glare cleanup
   if((frameIdx%3)===0 || !cache.lcMask){ const lc=buildLocalContrastMask(); cache.lcMask&&cache.lcMask.delete(); cache.lcMask=lc.clone(); lc.delete(); }
   cache.lcMask && cv.bitwise_or(fused, cache.lcMask, fused);
   if((frameIdx%3)===0 || !cache.glare){ buildGlareMask(); cache.glare&&cache.glare.delete(); cache.glare=glareMask.clone(); }
@@ -404,236 +249,75 @@ function process(){ if(!running) return; try{
   cv.morphologyEx(fused,fused,cv.MORPH_OPEN,kSmall); cv.morphologyEx(fused,fused,cv.MORPH_CLOSE,kSmall);
 
   // split touching
-  let finalMask;
-  if((frameIdx%PERF.DT_EVERY)===0 || !cache.dtMask){
-    cv.distanceTransform(fused,dt,cv.DIST_L2,3);
-    const dtn=new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX);
-    const kM=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(5,5));
-    const maxMap=new cv.Mat(); cv.dilate(dtn,maxMap,kM);
-    const localMax=new cv.Mat(); cv.compare(dtn,maxMap,localMax,cv.CMP_EQ);
-    localMax.convertTo(localMax,cv.CV_8U,255);
-    cv.bitwise_and(localMax,fused,localMax);
-    const fg=new cv.Mat(); cv.threshold(dtn,fg,0.20,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255);
-    cv.bitwise_or(fg,localMax,fg);
-    cv.morphologyEx(fg,fg,cv.MORPH_ERODE,kSmall);
-    finalMask=new cv.Mat(); cv.bitwise_and(fused,fg,finalMask);
-    cache.dtMask&&cache.dtMask.delete(); cache.dtMask=finalMask.clone();
-    dtn.delete(); fg.delete(); localMax.delete(); maxMap.delete();
-  } else { finalMask=cache.dtMask.clone(); }
+  let finalMask; if((frameIdx%PERF.DT_EVERY)===0 || !cache.dtMask){ cv.distanceTransform(fused,dt,cv.DIST_L2,3); const dtn=new cv.Mat(); cv.normalize(dt,dtn,0,1,cv.NORM_MINMAX); const kM=cv.getStructuringElement(cv.MORPH_ELLIPSE,new cv.Size(5,5)); const maxMap=new cv.Mat(); cv.dilate(dtn,maxMap,kM); const localMax=new cv.Mat(); cv.compare(dtn,maxMap,localMax,cv.CMP_EQ); localMax.convertTo(localMax,cv.CV_8U,255); cv.bitwise_and(localMax,fused,localMax); const fg=new cv.Mat(); cv.threshold(dtn,fg,0.20,1,cv.THRESH_BINARY); fg.convertTo(fg,cv.CV_8U,255); cv.bitwise_or(fg,localMax,fg); cv.morphologyEx(fg,fg,cv.MORPH_ERODE,kSmall); finalMask=new cv.Mat(); cv.bitwise_and(fused,fg,finalMask); cache.dtMask&&cache.dtMask.delete(); cache.dtMask=finalMask.clone(); dtn.delete(); fg.delete(); localMax.delete(); maxMap.delete(); }
+  else { finalMask=cache.dtMask.clone(); }
 
-  // contours -> detections
-  contours.delete(); contours=new cv.MatVector(); hierarchy.delete(); hierarchy=new cv.Mat();
-  cv.findContours(finalMask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
+  contours.delete(); contours=new cv.MatVector(); hierarchy.delete(); hierarchy=new cv.Mat(); cv.findContours(finalMask,contours,hierarchy,cv.RETR_EXTERNAL,cv.CHAIN_APPROX_SIMPLE);
 
   const gMean=cv.mean(gray)[0]; const dets=[]; const eqR=[];
   for(let i=0;i<contours.size();i++){
-    const cnt=contours.get(i);
-    const area=cv.contourArea(cnt); if(area<12){ cnt.delete(); continue; }
-    const peri=cv.arcLength(cnt,true);
-    const circ=(4*Math.PI*area)/(peri*peri+1e-6);
-    const hull=new cv.Mat(); cv.convexHull(cnt,hull);
-    const solid=area/Math.max(cv.contourArea(hull),1e-6);
-
-    const rect=cv.boundingRect(cnt); const roi=finalMask.roi(rect);
-    const cov=cv.countNonZero(roi)/(rect.width*rect.height); roi.delete();
-
-    const r2=gray.roi(rect); const m=new cv.Mat(); const s=new cv.Mat();
-    cv.meanStdDev(r2,m,s); const meanG=m.doubleAt(0,0); const stdG=s.doubleAt(0,0);
-    r2.delete(); m.delete(); s.delete();
-
-    let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0;
-    try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
+    const cnt=contours.get(i); const area=cv.contourArea(cnt); if(area<12){ cnt.delete(); continue; }
+    const peri=cv.arcLength(cnt,true); const circ=(4*Math.PI*area)/(peri*peri+1e-6); const hull=new cv.Mat(); cv.convexHull(cnt,hull); const solid=area/Math.max(cv.contourArea(hull),1e-6);
+    const rect=cv.boundingRect(cnt); const roi=finalMask.roi(rect); const cov=cv.countNonZero(roi)/(rect.width*rect.height); roi.delete();
+    const r2=gray.roi(rect); const m=new cv.Mat(); const s=new cv.Mat(); cv.meanStdDev(r2,m,s); const meanG=m.doubleAt(0,0); const stdG=s.doubleAt(0,0); r2.delete(); m.delete(); s.delete();
+    let isEllipse=false, ex=0,ey=0,er1=0,er2=0,eang=0; try{ if(cnt.total && cnt.total()>=5){ const rr=cv.fitEllipse(cnt); isEllipse=true; ex=rr.center.x; ey=rr.center.y; er1=rr.size.width/2; er2=rr.size.height/2; eang=rr.angle*Math.PI/180; } }catch{}
     const aspect=isEllipse ? Math.min(er1,er2)/Math.max(er1,er2) : 1;
-
     const roundOK=(circ>=0.58 && solid>=0.82 && aspect>=0.70);
     const capsuleOK=(solid>=0.86 && aspect>=0.30 && aspect<0.80);
     const brightOK=(meanG > gMean-8 && stdG < 95);
     const coverOK=(cov>0.04);
-
     let edgeOK=true, contrastOK=false, strong=false;
-    if(roundOK){
-      const M=cv.moments(cnt); const cxp=M.m10/(M.m00||1), cyp=M.m01/(M.m00||1); const rp=Math.max(6,Math.sqrt(area/Math.PI));
-      edgeOK=ringEdgeOK(cxp,cyp,rp); contrastOK=regionContrastOK(cxp,cyp,rp);
-    } else if(capsuleOK && isEllipse){
-      const rr=Math.max(er1,er2); contrastOK=regionContrastOK(ex,ey,rr);
-    }
-
+    if(roundOK){ const M=cv.moments(cnt); const cxp=M.m10/(M.m00||1), cyp=M.m01/(M.m00||1); const rp=Math.max(6,Math.sqrt(area/Math.PI)); edgeOK=ringEdgeOK(cxp,cyp,rp); contrastOK=regionContrastOK(cxp,cyp,rp); }
+    else if(capsuleOK && isEllipse){ const rr=Math.max(er1,er2); contrastOK=regionContrastOK(ex,ey,rr); }
     strong=((edgeOK||contrastOK) && brightOK && solid>0.82 && circ>0.60);
-
-    if(coverOK && ((roundOK && (edgeOK||contrastOK) && brightOK) || (capsuleOK && contrastOK && brightOK))){
-      if(roundOK){
-        const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1);
-        const r=Math.max(6,Math.sqrt(area/Math.PI));
-        const Rv=r*Math.sqrt((sX+sY)/2);
-        dets.push({type:'circle',x:offsetX+cx*sX,y:offsetY+cy*sY,r1:Rv,r2:Rv,a:0,score:circ*solid,strong});
-        eqR.push(Rv);
-      } else {
-        const Rv=Math.max(er1*sX, er2*sY);
-        dets.push({type:'ellipse',x:offsetX+ex*sX,y:offsetY+ey*sY,r1:er1*sX,r2:er2*sY,a:eang,score:solid,strong:false});
-        eqR.push(Rv);
-      }
-    }
+    if(coverOK && ((roundOK && (edgeOK||contrastOK) && brightOK) || (capsuleOK && contrastOK && brightOK))){ if(roundOK){ const M=cv.moments(cnt); const cx=M.m10/(M.m00||1), cy=M.m01/(M.m00||1); const r=Math.max(6,Math.sqrt(area/Math.PI)); const Rv=r*Math.sqrt((sX+sY)/2); dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:circ*solid,strong}); eqR.push(Rv);} else { const Rv=Math.max(er1*sX, er2*sY); dets.push({type:'ellipse',x:offsetX+ex*sX,y:offsetY+ey*sY,r1:er1*sX,r2:er2*sY,a:eang,score:solid,strong:false}); eqR.push(Rv);} }
     hull.delete(); cnt.delete();
   }
 
   // Hough booster (occasionally)
-  if((frameIdx%PERF.HOUGH_EVERY)===0){
-    const tmp=new cv.Mat(), circles=new cv.Mat();
-    cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0);
-    try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25,Math.max(6,Math.min(procW,procH)*0.05),180,40,5,Math.round(Math.min(procW,procH)*0.25)); }catch{}
-    for(let i=0;i<circles.cols;i++){
-      const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2];
-      if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue;
-      const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy)));
-      if(fused.ucharPtr(py,px)[0]===0) continue;
-      if(!(ringEdgeOK(cx,cy,r)||regionContrastOK(cx,cy,r))) continue;
-      const Rv=r*Math.sqrt((sX+sY)/2);
-      dets.push({type:'circle',x:offsetX+cx*sX,y:offsetY+cy*sY,r1:Rv,r2:Rv,a:0,score:0.95,strong:true});
-      eqR.push(Rv);
-    }
-    tmp.delete(); circles.delete();
-  }
+  if((frameIdx%PERF.HOUGH_EVERY)===0){ const tmp=new cv.Mat(), circles=new cv.Mat(); cv.GaussianBlur(blur,tmp,new cv.Size(3,3),1.0,1.0); try{ cv.HoughCircles(tmp,circles,cv.HOUGH_GRADIENT,1.25,Math.max(6,Math.min(procW,procH)*0.05),180,40,5,Math.round(Math.min(procW,procH)*0.25)); }catch{} for(let i=0;i<circles.cols;i++){ const cx=circles.data32F[i*3], cy=circles.data32F[i*3+1], r=circles.data32F[i*3+2]; if(!isFinite(cx)||!isFinite(cy)||!isFinite(r)) continue; const px=Math.min(procW-1,Math.max(0,Math.round(cx))), py=Math.min(procH-1,Math.max(0,Math.round(cy))); if(fused.ucharPtr(py,px)[0]===0) continue; if(!(ringEdgeOK(cx,cy,r)||regionContrastOK(cx,cy,r))) continue; const Rv=r*Math.sqrt((sX+sY)/2); dets.push({type:'circle',x:cx*sX,y:cy*sY,r1:Rv,r2:Rv,a:0,score:0.95,strong:true}); eqR.push(Rv);} tmp.delete(); circles.delete(); }
 
   if(eqR.length>=3){ const mid=median(eqR.filter(v=>isFinite(v))); sizePrior.R=sizePrior.R?(0.7*sizePrior.R+0.3*mid):mid; }
-  const R=sizePrior.R||median(eqR.length?eqR:[12]);
-  const minR=Math.max(5,R*0.35);
-  const maxR=Math.min(Math.min(vidW,vidH)*0.14,R*3.0);
+  const R=sizePrior.R||median(eqR.length?eqR:[12]); const minR=Math.max(5,R*0.35); const maxR=Math.min(Math.min(vidW,vidH)*0.14,R*3.0);
 
   // NMS + halo filter
-  dets.sort((a,b)=>b.r1-a.r1);
-  const merged=[], used=new Array(dets.length).fill(false);
-  for(let i=0;i<dets.length;i++){
-    if(used[i]) continue; const a=dets[i];
-    const big=Math.max(a.r1,a.r2), small=Math.min(a.r1,a.r2);
-    if(big>maxR || small<minR*0.6){ used[i]=true; continue; }
-    merged.push(a); used[i]=true;
-    for(let j=i+1;j<dets.length;j++){
-      if(used[j]) continue; const b=dets[j];
-      const d=Math.hypot(a.x-b.x,a.y-b.y);
-      const thr=Math.min(Math.max(a.r1,a.r2),Math.max(b.r1,b.r2))*0.48;
-      if(d<thr) used[j]=true;
-    }
-  }
-  const zones=lockedZones(performance.now());
-  let mergedFiltered=merged.filter(o=>!insideAnyZone(o.x,o.y,zones));
+  dets.sort((a,b)=>b.r1-a.r1); const merged=[], used=new Array(dets.length).fill(false); for(let i=0;i<dets.length;i++){ if(used[i]) continue; const a=dets[i]; const big=Math.max(a.r1,a.r2), small=Math.min(a.r1,a.r2); if(big>maxR || small<minR*0.6){ used[i]=true; continue; } merged.push(a); used[i]=true; for(let j=i+1;j<dets.length;j++){ if(used[j]) continue; const b=dets[j]; const d=Math.hypot(a.x-b.x,a.y-b.y); const thr=Math.min(Math.max(a.r1,a.r2),Math.max(b.r1,b.r2))*0.48; if(d<thr) used[j]=true; } }
+  const zones=lockedZones(performance.now()); let mergedFiltered=merged.filter(o=>!insideAnyZone(o.x,o.y,zones));
 
   // memory-based spawns
-  decayMemory();
-  for(const a of mergedFiltered){ depositMemory((a.x - offsetX)/sX, (a.y - offsetY)/sY); }
-  const sp=spawnFromMemory();
-  for(const p of sp){ const Rv=sizePrior.R||12; mergedFiltered.push({type:'circle',x:offsetX+p.cx*sX,y:offsetY+p.cy*sY,r1:Rv,r2:Rv,a:0,score:0.9,strong:true}); }
+  decayMemory(); for(const a of mergedFiltered){ depositMemory(a.x/sX, a.y/sY); } const sp=spawnFromMemory(); for(const p of sp){ const Rv=sizePrior.R||12; mergedFiltered.push({type:'circle',x:p.cx*sX,y:p.cy*sY,r1:Rv,r2:Rv,a:0,score:0.9,strong:true}); }
 
   assignTracks(mergedFiltered);
 
-  // dedupe tracks
-  (function(){
-    const keep=[];
-    const sorted=[...tracker.tracks].sort((a,b)=>((b.lockedUntil||0)-(a.lockedUntil||0))||((b.okHoldUntil||0)-(a.okHoldUntil||0))||((b.age||0)-(a.age||0)));
-    for(const t of sorted){
-      let dup=false;
-      for(const k of keep){
-        const d=Math.hypot(t.x-k.x,t.y-k.y);
-        const thr=Math.min(Math.max(t.r1||12,t.r2||12),Math.max(k.r1||12,k.r2||12))*0.60;
-        if(d<thr){ dup=true; break; }
-      }
-      if(!dup) keep.push(t);
-    }
-    tracker.tracks=keep;
-  })();
-  tracker.tracks=tracker.tracks.filter(t=>{
-    const big=Math.max(t.r1||12,t.r2||12), small=Math.min(t.r1||12,t.r2||12);
-    return big<=maxR*1.2 && small>=minR*0.5;
-  });
+  // dedupe tracks (keep most stable)
+  (function(){ const keep=[]; const sorted=[...tracker.tracks].sort((a,b)=>((b.lockedUntil||0)-(a.lockedUntil||0))||((b.okHoldUntil||0)-(a.okHoldUntil||0))||((b.age||0)-(a.age||0))); for(const t of sorted){ let dup=false; for(const k of keep){ const d=Math.hypot(t.x-k.x,t.y-k.y); const thr=Math.min(Math.max(t.r1||12,t.r2||12),Math.max(k.r1||12,k.r2||12))*0.60; if(d<thr){ dup=true; break; } } if(!dup) keep.push(t); } tracker.tracks=keep; })();
+  tracker.tracks=tracker.tracks.filter(t=>{ const big=Math.max(t.r1||12,t.r2||12), small=Math.min(t.r1||12,t.r2||12); return big<=maxR*1.2 && small>=minR*0.5; });
 
   // draw + count
-  octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3;
-  const now=performance.now(); let okCount=0;
-  for(const t of tracker.tracks){
-    const ok=(t.lockedUntil && now<t.lockedUntil) || (t.okSince && now<(t.okHoldUntil||0));
-    if(ok) okCount++;
-    octx.strokeStyle= ok? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)';
-    octx.fillStyle= ok? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)';
-    if(t.type==='ellipse' && Math.abs(t.r1-t.r2)>1){
-      octx.beginPath(); octx.ellipse(t.x,t.y,Math.max(6,t.r1),Math.max(6,t.r2),t.a,0,Math.PI*2); octx.stroke();
-    } else {
-      octx.beginPath(); octx.arc(t.x,t.y,Math.max(6,t.r1),0,Math.PI*2); octx.stroke();
-    }
-    octx.beginPath(); octx.arc(t.x,t.y,4,0,Math.PI*2); octx.fill();
-  }
+  octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; const now=performance.now(); let okCount=0; for(const t of tracker.tracks){ const ok=(t.lockedUntil && now<t.lockedUntil) || (t.okSince && now<(t.okHoldUntil||0)); if(ok) okCount++; octx.strokeStyle= ok? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)'; octx.fillStyle= ok? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)'; if(t.type==='ellipse' && Math.abs(t.r1-t.r2)>1){ octx.beginPath(); octx.ellipse(t.x,t.y,Math.max(6,t.r1),Math.max(6,t.r2),t.a,0,Math.PI*2); octx.stroke(); } else { octx.beginPath(); octx.arc(t.x,t.y,Math.max(6,t.r1),0,Math.PI*2); octx.stroke(); } octx.beginPath(); octx.arc(t.x,t.y,4,0,Math.PI*2); octx.fill(); }
   countEl.textContent=String(okCount);
 
   // finalize if stable or deadline
-  (function(){
-    const elapsed=performance.now()-startTs;
-    process._hist=process._hist||[];
-    process._hist.push(okCount);
-    if(process._hist.length>STABLE_WIN) process._hist.shift();
-    const min=Math.min(...process._hist), max=Math.max(...process._hist);
-    if(!frozen && ((process._hist.length>=STABLE_WIN && (max-min)<=STABLE_TOL && elapsed>1200) || elapsed>=DEADLINE_MS)){
-      freezeNow(Math.round(median(process._hist)));
-    }
-  })();
+  (function(){ const elapsed=performance.now()-startTs; process._hist=process._hist||[]; process._hist.push(okCount); if(process._hist.length>STABLE_WIN) process._hist.shift(); const min=Math.min(...process._hist), max=Math.max(...process._hist); if(!frozen && ((process._hist.length>=STABLE_WIN && (max-min)<=STABLE_TOL && elapsed>1200) || elapsed>=DEADLINE_MS)){ freezeNow(Math.round(median(process._hist))); } })();
 
-  finalMask.delete();
-  updateFps(); frameIdx++;
+  finalMask.delete(); updateFps(); frameIdx++;
 }catch(e){ console.error(e); showErr(e?.message||String(e)); }
   requestAnimationFrame(process);
 }
 
-// OpenCV ready
 window.cv=window.cv||{}; cv.onRuntimeInitialized=()=>{ startBtn.disabled=false; };
 
-// Start/resize
 startBtn.addEventListener('click', async()=>{
-  startBtn.disabled=true;
-  const ok=await startCamera();
-  if(ok){
-    const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); setTimeout(kickRefocus, 500);};
-    if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true});
-  } else { showErr('Could not start the camera.'); }
-  startBtn.disabled=false;
-});
+  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { showErr('Could not start the camera.'); } startBtn.disabled=false; });
 window.addEventListener('resize', ()=>{ if(video.videoWidth) syncBuffers(); });
 
-// Zoom slider (hardware if supported, otherwise soft)
-function updateCrop(){
-  const vw = video.videoWidth||vidW||640, vh = video.videoHeight||vidH||480;
-  const z = Math.max(1, softZoom);
-  cropW = Math.round(vw / z);
-  cropH = Math.round(vh / z);
-  cropX = Math.max(0, Math.round((vw - cropW)/2));
-  cropY = Math.max(0, Math.round((vh - cropH)/2));
-  offsetX = cropX; offsetY = cropY;
-  video.style.transform = `scale(${z})`;
-  overlay.style.transform = `scale(${z})`;
-  video.style.transformOrigin = overlay.style.transformOrigin = 'center center';
-}
-async function applyZoomFromSlider(){
-  if(!zoomEl) return;
-  const pct = Number(zoomEl.value)||100; const z = Math.max(1, pct/100);
-  if(zoomVal){ zoomVal.textContent = `${pct}%`; }
-  softZoom = z; useSoftZoom = true;
-  try{
-    if(stream){
-      const track = stream.getVideoTracks()[0];
-      const caps = track.getCapabilities ? track.getCapabilities() : {};
-      if(caps.zoom){
-        const {min,max} = caps.zoom; const mapped = min + (max-min) * ((pct-100)/200);
-        await track.applyConstraints({ advanced:[{ zoom: mapped }] });
-        useSoftZoom = false;
-      }
-    }
-  }catch{}
-  updateCrop(); syncBuffers(); kickRefocus();
-}
-if(zoomEl){ zoomEl.addEventListener('input', applyZoomFromSlider); }
-
-// Brightness (hardware if available + software + preview)
+// Brightness slider -> try hardware exposure first; fallback to software + preview
 brightEl.addEventListener('input', () => {
   userBright = Number(brightEl.value) | 0;
   brightVal.textContent = userBright;
   buildBrightLUT(userBright);
 
+  // (A) Try hardware exposure/brightness if supported
   try {
     if (stream) {
       const track = stream.getVideoTracks()[0];
@@ -650,51 +334,17 @@ brightEl.addEventListener('input', () => {
     }
   } catch {}
 
-  // visual preview
+  // (B) Visual preview (always works)
   const b = Math.max(0.2, 1 + userBright / 120);
   const c = Math.max(0.5, 1 + Math.abs(userBright) / 300);
-  video.style.filter = `brightness(${b}) contrast(${c})`; kickRefocus();
+  video.style.filter = `brightness(${b}) contrast(${c})`;
 });
 
-function resetAll(){
-  tracker.tracks=[]; tracker.nextId=1; sizePrior.R=null; frameIdx=0; process._hist=[];
-  octx.clearRect(0,0,overlay.width,overlay.height); countEl.textContent='…';
-  try{
-    cache.grad&&cache.grad.delete(); cache.grad=null;
-    cache.gradBin&&cache.gradBin.delete(); cache.gradBin=null;
-    cache.dtMask&&cache.dtMask.delete(); cache.dtMask=null;
-    cache.labMask&&cache.labMask.delete(); cache.labMask=null;
-    cache.lcMask&&cache.lcMask.delete(); cache.lcMask=null;
-    cache.glare&&cache.glare.delete(); cache.glare=null;
-  }catch{}
-  mem.cells&&mem.cells.fill(0);
-}
-async function refreshCamera(){
-  running=false; frozen=false; lastRefocusTs = performance.now();
-  try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch(e){}
-  stream=null; resetAll();
-  startBtn.disabled=true;
-  const ok = await startCamera();
-  if(ok){
-    syncBuffers();
-    running=true; frozen=false;
-    startTs=performance.now();
-    requestAnimationFrame(process);
-  } else {
-    showErr('Could not start the camera.');
-  }
-  startBtn.disabled=false;
-}
-
+function resetAll(){ tracker.tracks=[]; tracker.nextId=1; sizePrior.R=null; frameIdx=0; process._hist=[]; octx.clearRect(0,0,overlay.width,overlay.height); countEl.textContent='…'; try{ cache.grad&&cache.grad.delete(); cache.grad=null; cache.gradBin&&cache.gradBin.delete(); cache.gradBin=null; cache.dtMask&&cache.dtMask.delete(); cache.dtMask=null; cache.labMask&&cache.labMask.delete(); cache.labMask=null; cache.lcMask&&cache.lcMask.delete(); cache.lcMask=null; cache.glare&&cache.glare.delete(); cache.glare=null; }catch{} mem.cells&&mem.cells.fill(0); }
+async function refreshCamera(){ running=false; frozen=false; try{ if(stream){ stream.getTracks().forEach(t=>t.stop()); } }catch{} stream=null; resetAll(); startBtn.disabled=true; const ok=await startCamera(); if(ok){ syncBuffers(); running=true; frozen=false; startTs=performance.now(); requestAnimationFrame(process); } startBtn.disabled=false; }
 recountBtn.addEventListener('click', refreshCamera);
 
-window.addEventListener('beforeunload', ()=>{
-  try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{};
-  [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}});
-  cache.grad&&cache.grad.delete();
-  cache.gradBin&&cache.gradBin.delete();
-  cache.dtMask&&cache.dtMask.delete();
-});
+window.addEventListener('beforeunload', ()=>{ try{stream&&stream.getTracks().forEach(t=>t.stop());}catch{}; [src,rgb,hsv,gray,blur,mask,adaptive,hsvMask,fused,dt,glareMask,contours,hierarchy,kSmall,kBig,clahe,sobelX,sobelY,absX,absY,grad,gradBin].forEach(m=>{try{m&&m.delete()}catch{}}); cache.grad&&cache.grad.delete(); cache.gradBin&&cache.gradBin.delete(); cache.dtMask&&cache.dtMask.delete(); });
 </script>
 </body>
 </html>
