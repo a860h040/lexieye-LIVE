@@ -155,12 +155,16 @@ async function startCamera(){
     showErr('Camera not supported in this browser. Use Safari/Chrome over HTTPS.');
     return false;
   }
-  if(location.protocol!=='https:' && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
+  if(!window.isSecureContext && location.hostname!=='localhost' && location.hostname!=='127.0.0.1'){
     showErr('This page must be served over HTTPS or localhost for the camera to work.');
+    return false;
   }
   const tries=[
+    {video:{facingMode:'environment', width:{ideal:1280}, height:{ideal:720}}, audio:false},
     {video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}}, audio:false},
+    {video:{facingMode:'environment'}, audio:false},
     {video:{facingMode:{ideal:'environment'}, width:{ideal:960}, height:{ideal:540}}, audio:false},
+    {video:{facingMode:'user'}, audio:false}, // fallback to front camera if back camera fails
     {video:true, audio:false}
   ];
   try{ const devs=await navigator.mediaDevices.enumerateDevices(); const back=devs.find(d=>d.kind==='videoinput' && /back|environment/i.test(d.label||'')); if(back) tries.unshift({video:{deviceId:{exact:back.deviceId}, width:{ideal:1280}, height:{ideal:720}}, audio:false}); }catch{}
@@ -169,7 +173,9 @@ async function startCamera(){
     try{
       stream=await navigator.mediaDevices.getUserMedia(c);
       video.srcObject=stream; video.setAttribute('playsinline','true'); video.playsInline=true; video.muted=true; await video.play().catch(()=>{});
-      try{ const track=stream.getVideoTracks()[0]; const caps=track.getCapabilities?track.getCapabilities():{}; const adv=[]; if(caps.exposureMode)adv.push({exposureMode:'continuous'}); if(caps.whiteBalanceMode)adv.push({whiteBalanceMode:'continuous'}); if(caps.focusMode)adv.push({focusMode:'continuous'}); if(caps.exposureCompensation)adv.push({exposureCompensation:caps.exposureCompensation.max}); if(caps.torch)adv.push({torch:true}); if(adv.length) track.applyConstraints({advanced:adv}).catch(()=>{});}catch{}
+      try{ const track=stream.getVideoTracks()[0]; const caps=track.getCapabilities?track.getCapabilities():{}; const adv=[]; if(caps.exposureMode)adv.push({exposureMode:'continuous'}); if(caps.whiteBalanceMode)adv.push({whiteBalanceMode:'continuous'}); if(caps.focusMode)adv.push({focusMode:'continuous'}); if(caps.exposureCompensation)adv.push({exposureCompensation:caps.exposureCompensation.max}); /* torch disabled by default for broader compatibility on iOS/Safari
+         if(caps.torch)adv.push({torch:true});
+      */ if(adv.length) track.applyConstraints({advanced:adv}).catch(()=>{});}catch{}
       return true;
     }catch(e){ console.warn('gUM fail',c,e); lastErr=e; }
   }
@@ -333,7 +339,7 @@ function unlockFeedSize(){ const feed=document.querySelector('.feed'); if(!feed)
 function startAutoRefresh(){ try{ clearInterval(autoRefreshTimer); }catch{} autoRefreshTimer=setInterval(()=>{ if(running&&stream){ softRefreshDetection(); } }, DETECTION_REFRESH_MS); }
 
 startBtn.addEventListener('click', async()=>{
-  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { showErr('Could not start the camera.'); } startBtn.disabled=false; });
+  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { if(!errEl.textContent) showErr('Could not start the camera. Check HTTPS and browser site settings.'); } startBtn.disabled=false; });
 window.addEventListener('resize', ()=>{ if(video.videoWidth) syncBuffers(); });
 
 // Brightness slider -> try hardware exposure first; fallback to software "beta"
@@ -377,3 +383,4 @@ window.addEventListener('beforeunload', ()=>{
 </script>
 </body>
 </html>
+
