@@ -91,6 +91,10 @@ let startTs=0, frozen=false;
 const DEADLINE_MS=5000, STABLE_WIN=8, STABLE_TOL=1; // finalization
 const COUNT_FREEZE_MS=10000; // hold final number
 
+// Wait 10s after user clicks Enable before starting to count
+const COUNT_DELAY_MS = 10000;
+let countGateUntil = 0;
+
 // Auto refresh interval: soft detection reset every 20s
 const DETECTION_REFRESH_MS=20000;
 let autoRefreshTimer=null;
@@ -314,7 +318,8 @@ function process(){ if(!running) return; try{
 
   // draw + count
   octx.clearRect(0,0,overlay.width,overlay.height); octx.lineWidth=3; const now=performance.now(); let okCount=0; for(const t of tracker.tracks){ const ok = LIVE_MODE ? ((now - (t.seen||0)) < LIVE_DROP_MS) : ((t.lockedUntil && now<t.lockedUntil) || (t.okSince && now<(t.okHoldUntil||0))); if(ok) okCount++; octx.strokeStyle= ok? 'rgba(0,200,0,0.98)' : 'rgba(255,165,0,0.9)'; octx.fillStyle= ok? 'rgba(255,0,0,0.98)' : 'rgba(255,165,0,0.95)'; if(t.type==='ellipse' && Math.abs(t.r1-t.r2)>1){ octx.beginPath(); octx.ellipse(t.x,t.y,Math.max(6,t.r1),Math.max(6,t.r2),t.a,0,Math.PI*2); octx.stroke(); } else { octx.beginPath(); octx.arc(t.x,t.y,Math.max(6,t.r1),0,Math.PI*2); octx.stroke(); } octx.beginPath(); octx.arc(t.x,t.y,4,0,Math.PI*2); octx.fill(); }
-  countEl.textContent=String(okCount);
+  const countingActive = !countGateUntil || (now >= countGateUntil);
+  countEl.textContent = countingActive ? String(okCount) : '0';
 
   // finalize if stable or deadline
   (function(){ const elapsed=performance.now()-startTs; process._hist=process._hist||[]; process._hist.push(okCount); if(process._hist.length>STABLE_WIN) process._hist.shift(); const min=Math.min(...process._hist), max=Math.max(...process._hist); if(!LIVE_MODE && !frozen && ((process._hist.length>=STABLE_WIN && (max-min)<=STABLE_TOL && elapsed>1200) || elapsed>=DEADLINE_MS)){ freezeNow(Math.round(median(process._hist))); } })();
@@ -343,7 +348,7 @@ function unlockFeedSize(){ const feed=document.querySelector('.feed'); if(!feed)
 function startAutoRefresh(){ try{ clearInterval(autoRefreshTimer); }catch{} if(LIVE_MODE) return; autoRefreshTimer=setInterval(()=>{ if(running&&stream){ softRefreshDetection(); } }, DETECTION_REFRESH_MS); }
 
 startBtn.addEventListener('click', async()=>{
-  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { if(!errEl.textContent) showErr('Could not start the camera. Check HTTPS and browser site settings.'); } startBtn.disabled=false; });
+  startBtn.disabled=true; const ok=await startCamera(); if(ok){ const ready=()=>{ syncBuffers(); running=true; frozen=false; startTs=performance.now(); process._hist=[]; countGateUntil = performance.now() + COUNT_DELAY_MS; countEl.textContent='0'; requestAnimationFrame(process); startAutoRefresh(); }; if(video.readyState>=1) ready(); else video.addEventListener('loadedmetadata', ready, {once:true}); } else { if(!errEl.textContent) showErr('Could not start the camera. Check HTTPS and browser site settings.'); } startBtn.disabled=false; });
 window.addEventListener('resize', ()=>{ if(video.videoWidth) syncBuffers(); });
 
 // Brightness slider -> try hardware exposure first; fallback to software "beta"
